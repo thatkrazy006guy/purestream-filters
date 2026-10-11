@@ -2,18 +2,18 @@ name: PureStream Auto Watcher
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours automatically
-  workflow_dispatch: # Allows manual trigger button in GitHub UI
+    - cron: '0 */6 * * *' # Runs every 6 hours
+  workflow_dispatch: # Allows manual run button
 
 jobs:
   run-watcher:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -25,6 +25,6 @@ jobs:
       - name: Run Auto Watcher Script
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
           GIST_ID: "26c5299781dfbc13015947ebff5a6e66"
         run: python auto_watcher.py
