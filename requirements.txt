@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+PyGithub
+pysubs2
+pysrt
+subliminal
+requests
