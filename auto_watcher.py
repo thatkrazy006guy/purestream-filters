@@ -5,7 +5,7 @@ import json
 import re
 import pysubs2
 from datetime import datetime, timedelta
-from github import Github
+from github import Github, Auth, InputFileContent
 
 # --- API & ENVIRONMENT CONFIGURATION ---
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
@@ -33,7 +33,8 @@ BUFFER_MS = 1500
 rating_cache = {}
 
 def get_gist_db():
-    gh = Github(GITHUB_TOKEN)
+    auth = Auth.Token(GITHUB_TOKEN)
+    gh = Github(auth=auth)
     gist = gh.get_gist(GIST_ID)
     filename = list(gist.files.keys())[0]
     data = json.loads(gist.files[filename].content)
@@ -177,5 +178,5 @@ if __name__ == "__main__":
             print(f"Successfully added {title} to Gist!")
 
     if updated:
-        gist.edit(files={filename: {"content": json.dumps(db_data, indent=2)}})
+        gist.edit(files={filename: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
         print("Updated GitHub Gist Database successfully.")
