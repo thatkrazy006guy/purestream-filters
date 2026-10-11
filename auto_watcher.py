@@ -37,7 +37,11 @@ def get_gist_db():
     gh = Github(auth=auth)
     gist = gh.get_gist(GIST_ID)
     filename = list(gist.files.keys())[0]
-    data = json.loads(gist.files[filename].content)
+    
+    # Bypasses the 1MB PyGithub read limit by fetching the raw file directly
+    raw_url = gist.files[filename].raw_url
+    data = requests.get(raw_url).json()
+    
     return gh, gist, filename, data
 
 def merge_zones(zones):
