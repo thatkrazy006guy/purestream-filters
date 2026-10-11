@@ -7,6 +7,7 @@ import pysubs2
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from github import Github
+from github import InputFileContent
 
 app = FastAPI()
 
@@ -66,12 +67,10 @@ def report_title(req: ReportRequest):
     if req.media_type == "tv" and req.season and req.episode:
         formatted_title = f"{req.title} S{req.season:02d}E{req.episode:02d}"
 
-    # Process in temporary cloud directory
     with tempfile.TemporaryDirectory() as temp_dir:
         dummy_mp4 = os.path.join(temp_dir, f"{req.title}.mp4")
         open(dummy_mp4, "w").close()
 
-        # Download subtitles using Subliminal CLI
         os.system(f"subliminal download -l en '{dummy_mp4}'")
 
         found_subs = []
@@ -107,17 +106,22 @@ def report_title(req: ReportRequest):
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        # Update Gist Database directly via Github API
+        # Update Gist Database
         gh = Github(GITHUB_TOKEN)
         gist = gh.get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
-        db_data = json.loads(gist.files[gist_file].content)
+        
+        # Bypass 1MB read limit
+        raw_url = gist.files[gist_file].raw_url
+        db_data = requests.get(raw_url).json()
 
         db_data[formatted_title] = {
             "skipZones": all_zones,
             "advisories": {}
         }
 
-        gist.edit(files={gist_file: {"content": json.dumps(db_data, indent=2)}})
+        # Compact JSON upload
+        new_content = json.dumps(db_data, separators=(',', ':'))
+        gist.edit(files={gist_file: InputFileContent(content=new_content)})
 
     return {"status": "success", "title": formatted_title, "zones_added": len(all_zones)}
