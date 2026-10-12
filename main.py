@@ -163,45 +163,49 @@ last_scraped_title = ""
 @app.get("/api/netflix-sync")
 def netflix_sync():
     global last_scraped_title
+    import os
+    import requests
+    from bs4 import BeautifulSoup
+
+    # Automatically check for either environment variable name
+    cookie_val = os.environ.get("NETFLIX_RAW_COOKIE") or os.environ.get("SECURE_NETFLIX_ID")
     
-    # 1. Grab the FULL raw cookie string instead of just one piece
-    raw_cookie = os.environ.get("NETFLIX_RAW_COOKIE")
-    if not raw_cookie:
-        return {"status": "error", "message": "Missing NETFLIX_RAW_COOKIE in Render"}
+    if not cookie_val:
+        return {
+            "status": "error", 
+            "message": "No cookie found in Render. Set NETFLIX_RAW_COOKIE or SECURE_NETFLIX_ID in Render Environment variables."
+        }
+
+    # Format the header whether it's a full raw string or a single token
+    cookie_header = f"SecureNetflixId={cookie_val}" if "=" not in cookie_val else cookie_val
 
     url = "https://www.netflix.com/viewingactivity"
-    
-    # 2. Inject the raw cookie directly into the browser headers
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-        "Cookie": raw_cookie
+        "Cookie": cookie_header
     }
-    
+
     try:
-        import requests 
-        
-        # 3. Prevent automatic redirects to login if the cookie fails
         response = requests.get(url, headers=headers, allow_redirects=False)
         
-        # DEBUG: If Netflix kicks us to the login page, tell the user!
+        # Detect if Netflix rejected the session and sent us to login
         if response.status_code in [301, 302] and 'login' in response.headers.get('Location', ''):
-            return {"status": "error", "message": "Netflix rejected the cookie and redirected to login."}
-            
+            return {"status": "error", "message": "Netflix rejected the cookie and redirected to login. Grab a fresh cookie from Chrome."}
+
         soup = BeautifulSoup(response.text, 'html.parser')
-        
         first_title_tag = soup.select_one('.col.title a')
-        
+
         if not first_title_tag:
-            return {"status": "error", "message": "Cookie accepted, but no titles found. Netflix may have changed their website layout!"}
-            
+            return {"status": "error", "message": "Cookie accepted, but no title element found. Verify viewing activity in Chrome."}
+
         latest_title = first_title_tag.text.strip()
-        
+
         if latest_title != last_scraped_title:
             print(f"New Netflix Title Detected: {latest_title}")
             last_scraped_title = latest_title
             return {"status": "success", "title": latest_title, "action": "database_updated"}
-            
+
         return {"status": "success", "title": latest_title, "action": "no_change"}
-        
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
