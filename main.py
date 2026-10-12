@@ -164,29 +164,35 @@ last_scraped_title = ""
 def netflix_sync():
     global last_scraped_title
     
-    secure_netflix_id = os.environ.get("SECURE_NETFLIX_ID")
-    if not secure_netflix_id:
-        return {"status": "error", "message": "Missing Netflix Cookie"}
+    # 1. Grab the FULL raw cookie string instead of just one piece
+    raw_cookie = os.environ.get("NETFLIX_RAW_COOKIE")
+    if not raw_cookie:
+        return {"status": "error", "message": "Missing NETFLIX_RAW_COOKIE in Render"}
 
     url = "https://www.netflix.com/viewingactivity"
-    cookies = {"SecureNetflixId": secure_netflix_id}
+    
+    # 2. Inject the raw cookie directly into the browser headers
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+        "Cookie": raw_cookie
     }
     
     try:
-        # If your Render server doesn't have requests imported at the top of main.py, 
-        # make sure 'import requests' is added up there!
         import requests 
         
-        response = requests.get(url, cookies=cookies, headers=headers)
+        # 3. Prevent automatic redirects to login if the cookie fails
+        response = requests.get(url, headers=headers, allow_redirects=False)
+        
+        # DEBUG: If Netflix kicks us to the login page, tell the user!
+        if response.status_code in [301, 302] and 'login' in response.headers.get('Location', ''):
+            return {"status": "error", "message": "Netflix rejected the cookie and redirected to login."}
+            
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # FIXED: select_one instead of select_first
         first_title_tag = soup.select_one('.col.title a')
         
         if not first_title_tag:
-            return {"status": "error", "message": "No titles found or cookie expired."}
+            return {"status": "error", "message": "Cookie accepted, but no titles found. Netflix may have changed their website layout!"}
             
         latest_title = first_title_tag.text.strip()
         
