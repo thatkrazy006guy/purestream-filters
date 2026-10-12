@@ -7,6 +7,7 @@ import pysubs2
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from github import Github, InputFileContent
+from bs4 import BeautifulSoup
 
 app = FastAPI()
 
@@ -152,3 +153,52 @@ def report_title(req: ReportRequest):
         gist.edit(files={gist_file: InputFileContent(content=new_content)})
 
     return {"status": "success", "title": formatted_title, "zones_added": len(all_zones)}
+
+from bs4 import BeautifulSoup
+import os
+
+# Store the last scraped title to prevent spamming TMDB/Gist
+last_scraped_title = ""
+
+@app.get("/api/netflix-sync")
+def netflix_sync():
+    global last_scraped_title
+    
+    # 1. Grab your cookie from Render Environment Variables
+    secure_netflix_id = os.environ.get("SECURE_NETFLIX_ID")
+    if not secure_netflix_id:
+        return {"status": "error", "message": "Missing Netflix Cookie"}
+
+    # 2. Fetch the Viewing Activity silently
+    url = "https://www.netflix.com/viewingactivity"
+    cookies = {"SecureNetflixId": secure_netflix_id}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        response = requests.get(url, cookies=cookies, headers=headers)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 3. Netflix stores the title in a link inside the 'col title' column
+        first_title_tag = soup.select_first('.col.title a')
+        
+        if not first_title_tag:
+            return {"status": "error", "message": "No titles found or cookie expired."}
+            
+        latest_title = first_title_tag.text.strip()
+        
+        # 4. If the title is new, trigger your existing cloud scrape logic!
+        if latest_title != last_scraped_title:
+            print(f"New Netflix Title Detected: {latest_title}")
+            last_scraped_title = latest_title
+            
+            # HINT: You can call your existing TMDB/Gist functions here!
+            # Example: process_new_title(latest_title)
+            
+            return {"status": "success", "title": latest_title, "action": "database_updated"}
+            
+        return {"status": "success", "title": latest_title, "action": "no_change"}
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
