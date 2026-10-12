@@ -164,12 +164,10 @@ last_scraped_title = ""
 def netflix_sync():
     global last_scraped_title
     
-    # 1. Grab your cookie from Render Environment Variables
     secure_netflix_id = os.environ.get("SECURE_NETFLIX_ID")
     if not secure_netflix_id:
         return {"status": "error", "message": "Missing Netflix Cookie"}
 
-    # 2. Fetch the Viewing Activity silently
     url = "https://www.netflix.com/viewingactivity"
     cookies = {"SecureNetflixId": secure_netflix_id}
     headers = {
@@ -177,10 +175,14 @@ def netflix_sync():
     }
     
     try:
+        # If your Render server doesn't have requests imported at the top of main.py, 
+        # make sure 'import requests' is added up there!
+        import requests 
+        
         response = requests.get(url, cookies=cookies, headers=headers)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 3. Netflix stores the title in a link inside the 'col title' column
+        # FIXED: select_one instead of select_first
         first_title_tag = soup.select_one('.col.title a')
         
         if not first_title_tag:
@@ -188,14 +190,9 @@ def netflix_sync():
             
         latest_title = first_title_tag.text.strip()
         
-        # 4. If the title is new, trigger your existing cloud scrape logic!
         if latest_title != last_scraped_title:
             print(f"New Netflix Title Detected: {latest_title}")
             last_scraped_title = latest_title
-            
-            # HINT: You can call your existing TMDB/Gist functions here!
-            # Example: process_new_title(latest_title)
-            
             return {"status": "success", "title": latest_title, "action": "database_updated"}
             
         return {"status": "success", "title": latest_title, "action": "no_change"}
