@@ -4,6 +4,7 @@ import json
 import re
 import requests
 import pysubs2
+import subprocess
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from github import Github, InputFileContent
@@ -96,7 +97,8 @@ def report_title(req: ReportRequest):
             dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.mp4")
             open(dummy_mp4, "w").close()
             
-            os.system(f"subliminal download -l en '{dummy_mp4}'")
+            # FIXED: Subprocess completely ignores bad characters, quotes, and spaces!
+            subprocess.run(["subliminal", "download", "-l", "en", dummy_mp4])
 
             for ext in [".srt", ".ass", ".ssa", ".sub"]:
                 sub_file = os.path.join(temp_dir, f"{clean_query}{ext}")
