@@ -181,7 +181,7 @@ def netflix_sync():
         soup = BeautifulSoup(response.text, 'html.parser')
         
         # 3. Netflix stores the title in a link inside the 'col title' column
-        first_title_tag = soup.select_first('.col.title a')
+        first_title_tag = soup.select_one('.col.title a')
         
         if not first_title_tag:
             return {"status": "error", "message": "No titles found or cookie expired."}
