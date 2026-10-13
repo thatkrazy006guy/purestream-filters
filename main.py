@@ -233,13 +233,17 @@ def delete_movie(title: str):
         raw_url = gist.files[gist_file].raw_url
         db_data = requests.get(raw_url).json()
         
-        if title in db_data:
-            del db_data[title]
+        # Find all keys that contain the search string (case-insensitive)
+        keys_to_delete = [k for k in db_data.keys() if title.lower() in k.lower()]
+        
+        if keys_to_delete:
+            for k in keys_to_delete:
+                del db_data[k]
             new_content = json.dumps(db_data, separators=(',', ':'))
             gist.edit(files={gist_file: InputFileContent(content=new_content)})
-            return {"status": "success", "message": f"Successfully deleted '{title}' from the database!"}
+            return {"status": "success", "message": f"Deleted entry/entries: {keys_to_delete}"}
         else:
-            return {"status": "error", "message": f"'{title}' was not found in the database."}
+            return {"status": "error", "message": f"No movie containing '{title}' was found. Try a shorter keyword!"}
             
     except Exception as e:
         return {"status": "error", "message": str(e)}
