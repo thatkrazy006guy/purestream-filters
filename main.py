@@ -223,3 +223,23 @@ def netflix_sync():
         return {"status": "success", "title": latest_title}
     else:
         return {"status": "pending", "message": "Netflix has not updated yet. Polling again..."}
+@app.get("/api/delete-movie")
+def delete_movie(title: str):
+    try:
+        gh = Github(GITHUB_TOKEN)
+        gist = gh.get_gist(GIST_ID)
+        gist_file = list(gist.files.keys())[0]
+        
+        raw_url = gist.files[gist_file].raw_url
+        db_data = requests.get(raw_url).json()
+        
+        if title in db_data:
+            del db_data[title]
+            new_content = json.dumps(db_data, separators=(',', ':'))
+            gist.edit(files={gist_file: InputFileContent(content=new_content)})
+            return {"status": "success", "message": f"Successfully deleted '{title}' from the database!"}
+        else:
+            return {"status": "error", "message": f"'{title}' was not found in the database."}
+            
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
