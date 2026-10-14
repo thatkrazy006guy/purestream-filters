@@ -4,13 +4,11 @@ import tempfile
 import json
 import re
 import requests
-import urllib.parse
 import pysubs2
 import subprocess
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from github import Github, InputFileContent
-from bs4 import BeautifulSoup
 
 app = FastAPI()
 
@@ -67,59 +65,26 @@ def merge_zones(zones):
             merged.append(current)
     return merged
 
-def fetch_imdb_advisories(title, tmdb_api_key):
-    if not tmdb_api_key: return {}, None
+def fetch_tmdb_rating(media_id, media_type, api_key):
+    """Fetches official age certification from TMDB to avoid WAF blocks."""
+    if not api_key or not media_id: return ""
     try:
-        clean_title = re.sub(r'\s*S\d+E\d+.*', '', title, flags=re.IGNORECASE).strip()
-        tmdb_url = f"https://api.themoviedb.org/3/search/multi?api_key={tmdb_api_key}&query={clean_title}"
-        results = requests.get(tmdb_url, timeout=5).json().get("results", [])
-        if not results: return {}, None
-        
-        media_id = results[0]["id"]
-        media_type = results[0].get("media_type", "movie")
-        ext_url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/external_ids?api_key={tmdb_api_key}"
-        imdb_id = requests.get(ext_url, timeout=5).json().get("imdb_id")
-        if not imdb_id: return {}, None
-        
-        pg_url = f"https://www.imdb.com/title/{imdb_id}/parentalguide"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        # SURE-FIRE FIX: Rotating Proxy Array to bypass AWS WAF Blocks
-        proxies = [
-            "", 
-            "https://api.allorigins.win/raw?url=",
-            "https://corsproxy.io/?"
-        ]
-        
-        clean_text = ""
-        for proxy in proxies:
-            try:
-                target_url = proxy + urllib.parse.quote(pg_url, safe='') if proxy else pg_url
-                temp_res = requests.get(target_url, headers=headers, timeout=10)
-                if temp_res.status_code == 200 and "Sex & Nudity" in temp_res.text:
-                    clean_text = BeautifulSoup(temp_res.text, 'html.parser').get_text(separator=' ', strip=True)
-                    break
-            except: pass
-            
-        if not clean_text:
-            print("⚠️ IMDb Scraper: All proxies blocked by WAF.")
-            return {}, imdb_id
-            
-        advisories = {}
-        categories = ["Sex & Nudity", "Violence & Gore", "Profanity", "Alcohol, Drugs & Smoking", "Frightening & Intense Scenes"]
-        
-        for cat in categories:
-            cat_idx = clean_text.find(cat)
-            if cat_idx != -1:
-                snippet = clean_text[cat_idx:cat_idx+300]
-                match = re.search(r'\b(None|Mild|Moderate|Severe)\b', snippet, re.IGNORECASE)
-                if match: advisories[cat] = match.group(1).title()
-                
-        print(f"🎬 IMDb Scraper Success: {advisories}")
-        return advisories, imdb_id
+        if media_type == "movie":
+            url = f"https://api.themoviedb.org/3/movie/{media_id}/release_dates?api_key={api_key}"
+            res = requests.get(url, timeout=5).json()
+            for result in res.get("results", []):
+                if result.get("iso_3166_1") == "US":
+                    dates = result.get("release_dates", [])
+                    if dates: return dates[0].get("certification", "")
+        else:
+            url = f"https://api.themoviedb.org/3/tv/{media_id}/content_ratings?api_key={api_key}"
+            res = requests.get(url, timeout=5).json()
+            for result in res.get("results", []):
+                if result.get("iso_3166_1") == "US":
+                    return result.get("rating", "")
     except Exception as e:
-        print(f"⚠️ IMDb Scraper Error: {e}")
-        return {}, None
+        print(f"⚠️ TMDB Rating Error: {e}")
+    return ""
 
 def fetch_community_edl(imdb_id):
     if not imdb_id: return []
@@ -160,12 +125,23 @@ def report_title(req: ReportRequest):
     base_title = re.sub(r'\s*S\d+E\d+.*', '', formatted_title, flags=re.IGNORECASE).strip()
     if base_title != formatted_title: search_queries.append(base_title)
 
+    tmdb_media_id = None
+    tmdb_media_type = req.media_type
+    imdb_id = None
+
     if TMDB_API_KEY:
         try:
             res = requests.get("https://api.themoviedb.org/3/search/multi", params={"api_key": TMDB_API_KEY, "query": base_title}).json()
-            for item in res.get("results", [])[:3]:
-                official = item.get("title") or item.get("name")
+            results = res.get("results", [])
+            if results:
+                tmdb_media_id = results[0]["id"]
+                tmdb_media_type = results[0].get("media_type", "movie")
+                official = results[0].get("title") or results[0].get("name")
                 if official and official not in search_queries: search_queries.append(official)
+                
+                # Grab IMDb ID for EDL checking
+                ext_url = f"https://api.themoviedb.org/3/{tmdb_media_type}/{tmdb_media_id}/external_ids?api_key={TMDB_API_KEY}"
+                imdb_id = requests.get(ext_url, timeout=5).json().get("imdb_id")
         except: pass
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,49 +173,57 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (Cascading Model Array) ---
+        # --- LAYER 1: GROQ AI ENGINE (Dynamic Active Model Fetcher) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
             prompt = (
                 "You are a strict parental media filter. Read these specific numbered subtitle lines. "
                 "Identify ONLY the lines containing actual severe profanity, explicit sexual innuendo, or graphic visual descriptions in brackets. "
-                "Ignore mild words or non-explicit action (e.g. [pounding on door] or names like Dick). "
+                "Ignore mild words or non-explicit action. "
                 "Return ONLY a raw JSON array of the integers matching the line numbers that violate this policy. "
                 "Do not return any other text. Example: [15, 89, 102]\n\n"
                 f"{script_chunk}"
             )
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
-            # SURE-FIRE FIX: Iterate through all available models until one works
-            models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-8b-8192"]
-            ai_text = None
+            # Dynamically fetch available models from Groq to prevent 404/400 errors
+            active_model = None
+            try:
+                models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
+                if models_res.status_code == 200:
+                    models_data = models_res.json().get("data", [])
+                    # Filter for active Llama text models
+                    llama_models = [m["id"] for m in models_data if "llama" in m["id"].lower() and "whisper" not in m["id"].lower()]
+                    if llama_models:
+                        active_model = llama_models[0]
+            except Exception as e:
+                print(f"⚠️ Groq Model Fetch Error: {e}")
             
-            for model in models_to_try:
+            if active_model:
                 try:
-                    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+                    print(f"🔗 Using confirmed active model: {active_model}")
+                    payload = {"model": active_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
                     response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+                    
                     if response.status_code == 200:
                         ai_text = response.json()["choices"][0]["message"]["content"]
-                        break
+                        match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
+                        if match:
+                            bad_indices = json.loads(match.group(0))
+                            print(f"✅ AI SUCCESS: Groq validated {len(bad_indices)} true violations.")
+                            for idx in bad_indices:
+                                if 0 <= idx < len(subs):
+                                    start_ms = max(0, subs[idx].start - BUFFER_MS + platform_offset)
+                                    end_ms = subs[idx].end + BUFFER_MS + platform_offset
+                                    profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+                            ai_success = True
                     else:
-                        print(f"⚠️ Groq {model} rejected ({response.status_code}): {response.text}")
+                        print(f"⚠️ Groq AI rejected ({response.status_code}): {response.text}")
                 except Exception as e:
-                    print(f"⚠️ Groq {model} network fail: {e}")
-            
-            if ai_text:
-                match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
-                if match:
-                    bad_indices = json.loads(match.group(0))
-                    print(f"✅ AI SUCCESS: Groq validated {len(bad_indices)} true violations.")
-                    for idx in bad_indices:
-                        if 0 <= idx < len(subs):
-                            start_ms = max(0, subs[idx].start - BUFFER_MS + platform_offset)
-                            end_ms = subs[idx].end + BUFFER_MS + platform_offset
-                            profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
-                    ai_success = True
+                    print(f"⚠️ Groq AI network fail: {e}")
             else:
-                print("⚠️ All Groq models failed. Falling back to Regex!")
+                print("⚠️ No valid Groq models found on your account. Bypassing AI.")
         elif not GROQ_API_KEY:
             print("⚠️ GROQ_API_KEY missing. Bypassing AI Engine.")
 
@@ -256,18 +240,18 @@ def report_title(req: ReportRequest):
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
                 if PROFANITY_REGEX.search(spoken_text): profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
 
-        # --- LAYER 3: COMMUNITY MERGE ---
-        imdb_advisories, imdb_id = fetch_imdb_advisories(formatted_title, TMDB_API_KEY)
+        # --- LAYER 3: OFFICIAL RATING & COMMUNITY MERGE ---
+        tmdb_certification = fetch_tmdb_rating(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
         community_zones = fetch_community_edl(imdb_id)
         
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        final_advisories = {**({"Profanity": "Severe"} if any(z["skipType"] == "profanity" for z in all_zones) else {}),
-                            **({"Nudity & Explicit Content": "Moderate"} if any(z["skipType"] == "explicit" for z in all_zones) else {}),
-                            **imdb_advisories}
+        final_advisories = {}
+        if tmdb_certification: final_advisories["Official Rating"] = tmdb_certification
+        if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
+        if any(z["skipType"] == "explicit" for z in all_zones): final_advisories["Nudity & Explicit Content"] = "Moderate"
 
-        # SURE-FIRE FIX: 409 Retry Loop for perfect Database syncing
         max_retries = 3
         for attempt in range(max_retries):
             try:
