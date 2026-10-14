@@ -12,13 +12,12 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# --- CLOUD CONFIGURATION (With .strip() to fix hidden spaces in keys) ---
+# --- CLOUD CONFIGURATION ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GIST_ID = os.getenv("GIST_ID", "26c5299781dfbc13015947ebff5a6e66").strip()
 
-# FIXED: Zeroed out because .WEB-DL subtitles already have the streaming logos baked in!
 PLATFORM_OFFSETS = {
     "com.wbd.stream": 0,
     "com.hbo.hbonow": 0,
@@ -80,17 +79,21 @@ def fetch_imdb_advisories(title, tmdb_api_key):
         imdb_id = requests.get(ext_url).json().get("imdb_id")
         if not imdb_id: return {}, None
         
-        # FIXED: Added Accept-Language to bypass IMDb's bot-firewall
         pg_url = f"https://www.imdb.com/title/{imdb_id}/parentalguide"
         headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
         res = requests.get(pg_url, headers=headers)
+        
+        # FIXED: Strip all HTML tags so the hidden code doesn't break our search
+        clean_html = re.sub(r'<[^>]+>', ' ', res.text)
+        clean_html = re.sub(r'\s+', ' ', clean_html)
         
         advisories = {}
         categories = ["Sex & Nudity", "Violence & Gore", "Profanity", "Alcohol, Drugs & Smoking", "Frightening & Intense Scenes"]
         
         for cat in categories:
-            regex_str = re.escape(cat) + r'.{0,800}?(None|Mild|Moderate|Severe)'
-            match = re.compile(regex_str, re.IGNORECASE | re.DOTALL).search(res.text)
+            # We now scan the pure text document, making the search 100x more reliable
+            regex_str = re.escape(cat) + r'.{0,150}?(None|Mild|Moderate|Severe)'
+            match = re.compile(regex_str, re.IGNORECASE).search(clean_html)
             if match: advisories[cat] = match.group(1).title()
                 
         print(f"🎬 IMDb Scraper Success: {advisories}")
@@ -186,8 +189,9 @@ def report_title(req: ReportRequest):
                 )
 
                 headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-                # Shifted to their most stable legacy model to prevent 404 routing errors
-                payload = {"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+                
+                # FIXED: Upgraded to 3.1 8B Instant (128,000 token limit) to prevent 400 Bad Request
+                payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
                 
                 response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=60)
                 response.raise_for_status()
@@ -230,7 +234,6 @@ def report_title(req: ReportRequest):
                             **({"Nudity & Explicit Content": "Moderate"} if any(z["skipType"] == "explicit" for z in all_zones) else {}),
                             **imdb_advisories}
 
-        # FIXED: Crash-Handler for 409 Race Conditions (Double Requests)
         try:
             gh = Github(GITHUB_TOKEN)
             gist = gh.get_gist(GIST_ID)
