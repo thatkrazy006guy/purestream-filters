@@ -66,6 +66,44 @@ def merge_zones(zones):
             merged.append(current)
     return merged
 
+def fetch_imdb_advisories(title, tmdb_api_key):
+    """Scrapes exact Nudity/Drugs/Violence severities from IMDb Parents Guide."""
+    if not tmdb_api_key: return {}
+    try:
+        # 1. Use TMDB to securely find the official IMDb ID
+        clean_title = re.sub(r'\s*S\d+E\d+.*', '', title, flags=re.IGNORECASE).strip()
+        tmdb_url = f"https://api.themoviedb.org/3/search/multi?api_key={tmdb_api_key}&query={clean_title}"
+        results = requests.get(tmdb_url).json().get("results", [])
+        if not results: return {}
+        
+        media_item = results[0]
+        media_id = media_item["id"]
+        media_type = media_item.get("media_type", "movie")
+        
+        ext_url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/external_ids?api_key={tmdb_api_key}"
+        imdb_id = requests.get(ext_url).json().get("imdb_id")
+        if not imdb_id: return {}
+        
+        # 2. Scrape the live IMDb HTML 
+        pg_url = f"https://www.imdb.com/title/{imdb_id}/parentalguide"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        res = requests.get(pg_url, headers=headers)
+        
+        advisories = {}
+        categories = ["Sex & Nudity", "Violence & Gore", "Profanity", "Alcohol, Drugs & Smoking", "Frightening & Intense Scenes"]
+        
+        for cat in categories:
+            # Dynamically scan the HTML for the community severity tags
+            pattern = re.compile(fr'{re.escape(cat)}.{'{0,500}'}?(None|Mild|Moderate|Severe)', re.IGNORECASE | re.DOTALL)
+            match = pattern.search(res.text)
+            if match:
+                advisories[cat] = match.group(1).title()
+                
+        return advisories
+    except Exception as e:
+        print(f"IMDb Scraper Error: {e}")
+        return {}
+
 @app.get("/")
 def health_check():
     return {"status": "PureStream Universal Cloud Service Running"}
@@ -145,6 +183,19 @@ def report_title(req: ReportRequest):
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
+        # Layer 1: Subtitle-based Advisories
+        advisories_map = {}
+        if any(z["skipType"] == "profanity" for z in all_zones):
+            advisories_map["Profanity"] = "Severe"
+        if any(z["skipType"] == "explicit" for z in all_zones):
+            advisories_map["Nudity & Explicit Content"] = "Moderate"
+
+        # Layer 2: Scrape IMDb Parents Guide for community severities
+        imdb_advisories = fetch_imdb_advisories(formatted_title, TMDB_API_KEY)
+
+        # Merge them (IMDb community data overwrites the basic subtitle scan if there are duplicates)
+        final_advisories = {**advisories_map, **imdb_advisories}
+
         gh = Github(GITHUB_TOKEN)
         gist = gh.get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
@@ -154,7 +205,7 @@ def report_title(req: ReportRequest):
 
         db_data[formatted_title] = {
             "skipZones": all_zones,
-            "advisories": {}
+            "advisories": final_advisories
         }
 
         new_content = json.dumps(db_data, separators=(',', ':'))
