@@ -9,7 +9,6 @@ import subprocess
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from github import Github, InputFileContent
-from bs4 import BeautifulSoup
 
 app = FastAPI()
 
@@ -67,7 +66,6 @@ def merge_zones(zones):
     return merged
 
 def fetch_tmdb_rating(media_id, media_type, api_key):
-    """SURE-FIRE FIX: Uses official TMDB API to bypass all WAF/Firewall blocks."""
     if not api_key or not media_id: return ""
     try:
         if media_type == "movie":
@@ -83,8 +81,7 @@ def fetch_tmdb_rating(media_id, media_type, api_key):
             for result in res.get("results", []):
                 if result.get("iso_3166_1") == "US":
                     return result.get("rating", "")
-    except Exception as e:
-        print(f"⚠️ TMDB Rating Error: {e}")
+    except: pass
     return ""
 
 def fetch_community_edl(imdb_id):
@@ -104,7 +101,6 @@ def fetch_community_edl(imdb_id):
                     "endTimeMs": int(float(parts[1]) * 1000), 
                     "skipType": "profanity" if parts[2] == "1" else "explicit"
                 })
-        print(f"🌐 EDL Scraper: Found {len(community_zones)} community skips!")
         return community_zones
     except: return []
 
@@ -126,9 +122,7 @@ def report_title(req: ReportRequest):
     base_title = re.sub(r'\s*S\d+E\d+.*', '', formatted_title, flags=re.IGNORECASE).strip()
     if base_title != formatted_title: search_queries.append(base_title)
 
-    tmdb_media_id = None
-    tmdb_media_type = req.media_type
-    imdb_id = None
+    tmdb_media_id, tmdb_media_type, imdb_id = None, req.media_type, None
 
     if TMDB_API_KEY:
         try:
@@ -173,7 +167,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (SURE-FIRE DYNAMIC MODEL FETCHER) ---
+        # --- LAYER 1: GROQ AI ENGINE (Sanity-Checked) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -187,20 +181,18 @@ def report_title(req: ReportRequest):
             )
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
-            # 1. Ask Groq which models your API key is actually allowed to use
-            active_models = ["llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
+            # Anti-Sabotage 1: Force Llama models to the absolute front of the line
+            preferred_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
+            active_models = preferred_models.copy()
             try:
                 models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
                 if models_res.status_code == 200:
                     fetched_models = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower()]
-                    active_models = fetched_models + active_models
+                    for m in fetched_models:
+                        if m not in active_models: active_models.append(m)
             except: pass
             
-            # Deduplicate the list while preserving order
-            unique_models = list(dict.fromkeys(active_models))
-            
-            # 2. Try the authorized models until one succeeds
-            for model in unique_models:
+            for model in active_models:
                 try:
                     payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
                     response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
@@ -210,6 +202,13 @@ def report_title(req: ReportRequest):
                         match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
                         if match:
                             bad_indices = json.loads(match.group(0))
+                            
+                            # Anti-Sabotage 2: Sanity check the AI's math
+                            if len(bad_indices) == 0 and len(suspicious_lines) > 0:
+                                print(f"⚠️ Groq ({model}) hallucinated 0 violations. Rejecting AI response.")
+                                ai_success = False 
+                                break # Exit the model loop, force Regex
+                                
                             print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                             for idx in bad_indices:
                                 if 0 <= idx < len(subs):
@@ -217,15 +216,12 @@ def report_title(req: ReportRequest):
                                     end_ms = subs[idx].end + BUFFER_MS + platform_offset
                                     profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
                             ai_success = True
-                            break # Success! Stop trying models.
-                except Exception:
-                    pass
+                            break
+                except: pass
             
             if not ai_success:
-                print("⚠️ All Groq models rejected. Bypassing AI.")
-        elif not GROQ_API_KEY:
-            print("⚠️ GROQ_API_KEY missing. Bypassing AI Engine.")
-
+                print("⚠️ AI failed sanity check or network limits. Bypassing AI Engine.")
+        
         # --- LAYER 2: REGEX FALLBACK ---
         if not ai_success:
             print("⚙️ Running standard Regex Engine...")
@@ -251,7 +247,7 @@ def report_title(req: ReportRequest):
         if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
         if any(z["skipType"] == "explicit" for z in all_zones): final_advisories["Nudity & Explicit Content"] = "Moderate"
 
-        # SURE-FIRE FIX: 409 Retry Loop for perfect Database syncing
+        # --- Anti-Sabotage 3: The Data Protector ---
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -260,17 +256,20 @@ def report_title(req: ReportRequest):
                 gist_file = list(gist.files.keys())[0]
                 db_data = requests.get(gist.files[gist_file].raw_url).json()
 
+                # Protect against overwriting a perfectly good scrape with a blank scrape
+                existing_zones = db_data.get(formatted_title, {}).get("skipZones", [])
+                if len(all_zones) == 0 and len(existing_zones) > 0:
+                    print("🛡️ Anti-Overwrite Protocol: Prevented an empty scan from wiping out existing database zones.")
+                    break # Stop saving, keep the good data
+
                 db_data[formatted_title] = {"skipZones": all_zones, "advisories": final_advisories}
                 gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
                 print(f"✅ GitHub Save Success (Attempt {attempt + 1})")
                 break
             except Exception as e:
                 if "409" in str(e) and attempt < max_retries - 1:
-                    print(f"⚠️ 409 Conflict: Merging data and retrying... (Attempt {attempt + 1})")
                     time.sleep(2)
-                else:
-                    print(f"❌ GitHub Save Error: {e}")
-                    break
+                else: break
 
     return {"status": "success", "title": formatted_title, "zones_added": len(all_zones)}
 
