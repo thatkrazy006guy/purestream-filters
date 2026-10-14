@@ -17,6 +17,16 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 GIST_ID = os.getenv("GIST_ID", "26c5299781dfbc13015947ebff5a6e66")
 
+# --- PLATFORM PRE-ROLL OFFSETS (in Milliseconds) ---
+PLATFORM_OFFSETS = {
+    "com.wbd.stream": 7000,                     # Max / HBO Max
+    "com.hbo.hbonow": 7000,                     # Legacy HBO
+    "com.hulu.livingroomplus": 4000,            # Hulu
+    "com.disney.disneyplus": 5000,              # Disney+
+    "com.amazon.amazonvideo.livingroom": 2000,  # Prime Video
+    "com.netflix.ninja": 0                      # Netflix (Standard)
+}
+
 # --- TRIGGER LISTS ---
 EXPLICIT_WORDS = [
     "fuck", "fucking", "fucked", "fucker", "motherfucker",
@@ -34,7 +44,6 @@ VISUAL_CUES = [
 ]
 EXPLICIT_REGEX = re.compile(r'[\[\(].*?\b(?:' + '|'.join(VISUAL_CUES) + r')\b.*?[\]\)]', re.IGNORECASE)
 
-# FIXED: Dropped from 1500 to 500 for tight, accurate muting without dead air
 BUFFER_MS = 500
 
 class ReportRequest(BaseModel):
@@ -43,6 +52,7 @@ class ReportRequest(BaseModel):
     title: str
     season: int = None
     episode: int = None
+    package_name: str = ""
 
 def merge_zones(zones):
     if not zones: return []
@@ -58,7 +68,7 @@ def merge_zones(zones):
 
 @app.get("/")
 def health_check():
-    return {"status": "PureStream Cloud Service Running"}
+    return {"status": "PureStream Universal Cloud Service Running"}
 
 @app.post("/api/report-title")
 def report_title(req: ReportRequest):
@@ -69,8 +79,10 @@ def report_title(req: ReportRequest):
     if req.media_type == "tv" and req.season and req.episode:
         formatted_title = f"{req.title} S{req.season:02d}E{req.episode:02d}"
 
+    # Determine studio logo delay for the active app
+    platform_offset = PLATFORM_OFFSETS.get(req.package_name, 0)
+
     search_queries = [formatted_title]
-    
     base_title = re.sub(r'\s*S\d+E\d+.*', '', formatted_title, flags=re.IGNORECASE).strip()
     if base_title != formatted_title and base_title not in search_queries:
         search_queries.append(base_title)
@@ -90,9 +102,6 @@ def report_title(req: ReportRequest):
         
         for query in search_queries:
             clean_query = re.sub(r'[\\/:*?"<>|]', '', query).strip()
-            
-            # FIXED: We append ".1080p.WEB-DL.mp4" to force the subtitle engine to exclusively fetch 
-            # streaming-synced subtitles (Netflix/HBO) instead of misaligned BluRay rips!
             dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.WEB-DL.mp4")
             open(dummy_mp4, "w").close()
             
@@ -121,15 +130,14 @@ def report_title(req: ReportRequest):
         explicit_zones = []
 
         for sub in subs:
-            start_ms = max(0, sub.start - BUFFER_MS)
-            end_ms = sub.end + BUFFER_MS
+            # Apply platform-specific intro offset + buffer
+            start_ms = max(0, sub.start - BUFFER_MS + platform_offset)
+            end_ms = sub.end + BUFFER_MS + platform_offset
             text = sub.plaintext
 
-            # 1. Grab visual/explicit cues inside brackets
             if EXPLICIT_REGEX.search(text):
                 explicit_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "explicit"})
 
-            # 2. Strip SDH brackets [like this] BEFORE scanning for profanity to avoid false positives
             spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
             if PROFANITY_REGEX.search(spoken_text):
                 profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
@@ -152,13 +160,10 @@ def report_title(req: ReportRequest):
         new_content = json.dumps(db_data, separators=(',', ':'))
         gist.edit(files={gist_file: InputFileContent(content=new_content)})
 
-    return {"status": "success", "title": formatted_title, "zones_added": len(all_zones)}
+    return {"status": "success", "title": formatted_title, "zones_added": len(all_zones), "platform_offset_ms": platform_offset}
 
 last_scraped_title = ""
-
-LIVE_EXCLUSIONS = [
-    "wwe raw", "wwe smackdown", "wwe nxt", "wwe", "netflix live", "live from"
-]
+LIVE_EXCLUSIONS = ["wwe raw", "wwe smackdown", "wwe nxt", "wwe", "netflix live", "live from"]
 
 @app.get("/api/netflix-sync")
 def netflix_sync():
@@ -173,41 +178,31 @@ def netflix_sync():
         return {"status": "error", "message": "No cookie found."}
 
     cookie_header = f"SecureNetflixId={cookie_val}" if "=" not in cookie_val else cookie_val
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Cookie": cookie_header
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": cookie_header}
 
     latest_title = None
 
     try:
         url_activity = "https://www.netflix.com/viewingactivity"
         response = requests.get(url_activity, headers=headers, allow_redirects=False)
-        
-        if response.status_code in [301, 302] and 'login' in response.headers.get('Location', ''):
-            return {"status": "error", "message": "Cookie expired."}
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        first_title_tag = soup.select_one('.col.title a')
-
-        if first_title_tag:
-            activity_title = first_title_tag.text.strip()
-            if not any(ex in activity_title.lower() for ex in LIVE_EXCLUSIONS):
-                latest_title = activity_title
-    except Exception as e:
+        if response.status_code not in [301, 302]:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            first_title_tag = soup.select_one('.col.title a')
+            if first_title_tag:
+                activity_title = first_title_tag.text.strip()
+                if not any(ex in activity_title.lower() for ex in LIVE_EXCLUSIONS):
+                    latest_title = activity_title
+    except Exception:
         pass
 
     if latest_title == last_scraped_title or not latest_title:
         try:
             url_browse = "https://www.netflix.com/browse"
             res_browse = requests.get(url_browse, headers=headers)
-            
             cw_chunk_match = re.search(r'"listContext":"continueWatching".*?\]', res_browse.text)
             if cw_chunk_match:
                 cw_chunk = cw_chunk_match.group(0)
                 raw_titles = re.findall(r'"title":"(.*?)"', cw_chunk)
-                
                 for raw_t in raw_titles:
                     cw_title = raw_t.encode('utf-8').decode('unicode_escape').strip()
                     if any(exclusion in cw_title.lower() for exclusion in LIVE_EXCLUSIONS):
@@ -215,35 +210,51 @@ def netflix_sync():
                     if cw_title and cw_title != last_scraped_title:
                         latest_title = cw_title
                         break
-        except Exception as e:
+        except Exception:
             pass
 
     if latest_title and latest_title != last_scraped_title:
         last_scraped_title = latest_title
         return {"status": "success", "title": latest_title}
     else:
-        return {"status": "pending", "message": "Netflix has not updated yet. Polling again..."}
+        return {"status": "pending", "message": "Netflix has not updated yet."}
+
 @app.get("/api/delete-movie")
 def delete_movie(title: str):
     try:
         gh = Github(GITHUB_TOKEN)
         gist = gh.get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
+        db_data = requests.get(gist.files[gist_file].raw_url).json()
         
-        raw_url = gist.files[gist_file].raw_url
-        db_data = requests.get(raw_url).json()
-        
-        # Find all keys that contain the search string (case-insensitive)
         keys_to_delete = [k for k in db_data.keys() if title.lower() in k.lower()]
-        
         if keys_to_delete:
             for k in keys_to_delete:
                 del db_data[k]
-            new_content = json.dumps(db_data, separators=(',', ':'))
-            gist.edit(files={gist_file: InputFileContent(content=new_content)})
-            return {"status": "success", "message": f"Deleted entry/entries: {keys_to_delete}"}
-        else:
-            return {"status": "error", "message": f"No movie containing '{title}' was found. Try a shorter keyword!"}
+            gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
+            return {"status": "success", "message": f"Deleted: {keys_to_delete}"}
+        return {"status": "error", "message": f"No entry containing '{title}' found."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/shift-sync")
+def shift_sync(title: str, offset_ms: int):
+    try:
+        gh = Github(GITHUB_TOKEN)
+        gist = gh.get_gist(GIST_ID)
+        gist_file = list(gist.files.keys())[0]
+        db_data = requests.get(gist.files[gist_file].raw_url).json()
+        
+        matched_keys = [k for k in db_data.keys() if title.lower() in k.lower()]
+        if not matched_keys:
+            return {"status": "error", "message": f"No title containing '{title}' found."}
             
+        for k in matched_keys:
+            for zone in db_data[k].get("skipZones", []):
+                zone["startTimeMs"] += offset_ms
+                zone["endTimeMs"] += offset_ms
+                
+        gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
+        return {"status": "success", "message": f"Shifted {matched_keys} by {offset_ms}ms"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
