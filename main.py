@@ -104,6 +104,44 @@ def fetch_imdb_advisories(title, tmdb_api_key):
         print(f"IMDb Scraper Error: {e}")
         return {}
 
+def fetch_community_edl(imdb_id):
+    """
+    Scrapes open-source EDL (Edit Decision List) repositories for community-sourced 
+    visual skips (nudity, gore) that subtitles cannot detect.
+    """
+    if not imdb_id: return []
+    
+    # Example: A centralized GitHub repository URL where community EDL files are hosted.
+    # (You can replace this with a specific community repo or a secondary Gist of your own)
+    edl_repo_url = f"https://raw.githubusercontent.com/PureStreamCommunity/EDL-Database/main/movies/{imdb_id}.edl"
+    
+    try:
+        res = requests.get(edl_repo_url, timeout=3)
+        if res.status_code != 200:
+            return []
+            
+        community_zones = []
+        for line in res.text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            
+            # EDL Format: start_time end_time action (0 = skip visual, 1 = mute audio)
+            parts = line.split()
+            if len(parts) >= 3:
+                start_ms = int(float(parts[0]) * 1000)
+                end_ms = int(float(parts[1]) * 1000)
+                action = "profanity" if parts[2] == "1" else "explicit"
+                
+                community_zones.append({
+                    "startTimeMs": start_ms, 
+                    "endTimeMs": end_ms, 
+                    "skipType": action
+                })
+        return community_zones
+    except Exception as e:
+        print(f"EDL Fetch Error: {e}")
+        return []
+
 @app.get("/")
 def health_check():
     return {"status": "PureStream Universal Cloud Service Running"}
