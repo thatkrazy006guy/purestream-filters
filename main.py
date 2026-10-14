@@ -83,18 +83,19 @@ def fetch_imdb_advisories(title, tmdb_api_key):
         headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
         res = requests.get(pg_url, headers=headers)
         
-        # FIXED: Strip all HTML tags so the hidden code doesn't break our search
-        clean_html = re.sub(r'<[^>]+>', ' ', res.text)
-        clean_html = re.sub(r'\s+', ' ', clean_html)
+        # FIXED: Use BeautifulSoup to strip ALL HTML tags and flatten to pure text
+        clean_text = BeautifulSoup(res.text, 'html.parser').get_text(separator=' ', strip=True)
         
         advisories = {}
         categories = ["Sex & Nudity", "Violence & Gore", "Profanity", "Alcohol, Drugs & Smoking", "Frightening & Intense Scenes"]
         
         for cat in categories:
-            # We now scan the pure text document, making the search 100x more reliable
-            regex_str = re.escape(cat) + r'.{0,150}?(None|Mild|Moderate|Severe)'
-            match = re.compile(regex_str, re.IGNORECASE).search(clean_html)
-            if match: advisories[cat] = match.group(1).title()
+            cat_idx = clean_text.find(cat)
+            if cat_idx != -1:
+                # Grab the next 300 characters after the category name
+                snippet = clean_text[cat_idx:cat_idx+300]
+                match = re.search(r'\b(None|Mild|Moderate|Severe)\b', snippet, re.IGNORECASE)
+                if match: advisories[cat] = match.group(1).title()
                 
         print(f"🎬 IMDb Scraper Success: {advisories}")
         return advisories, imdb_id
@@ -155,7 +156,10 @@ def report_title(req: ReportRequest):
             clean_query = re.sub(r'[\\/:*?"<>|]', '', query).strip()
             dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.WEB-DL.mp4")
             open(dummy_mp4, "w").close()
-            subprocess.run(["subliminal", "download", "-l", "en", dummy_mp4])
+            
+            # FIXED: Added stderr=subprocess.DEVNULL to silence the noisy Linux DBM crash logs
+            subprocess.run(["subliminal", "download", "-l", "en", dummy_mp4], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
             for file in os.listdir(temp_dir):
                 if file.startswith(clean_query) and not file.endswith(".mp4"):
                     found_subs.append(os.path.join(temp_dir, file))
@@ -172,35 +176,40 @@ def report_title(req: ReportRequest):
 
         profanity_zones, explicit_zones, ai_success = [], [], False
         
-        # --- LAYER 1: GROQ AI ENGINE ---
-        if GROQ_API_KEY:
+        # --- PRE-FILTER: Gather only suspicious lines to stay under Groq's Token Limit ---
+        suspicious_lines = []
+        for i, sub in enumerate(subs):
+            text = sub.plaintext.replace('\n', ' ').strip()
+            if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
+                suspicious_lines.append(f"{i}|{text}")
+
+        # --- LAYER 1: GROQ AI ENGINE (Two-Pass Context) ---
+        if GROQ_API_KEY and suspicious_lines:
             try:
-                print("🧠 Booting Groq AI Context Engine...")
-                sub_lines = [f"{i}|{sub.plaintext.replace('\n', ' ').strip()}" for i, sub in enumerate(subs)]
-                full_script = "\n".join(sub_lines)
+                print(f"🧠 Booting Groq AI Two-Pass Engine on {len(suspicious_lines)} flagged lines...")
+                script_chunk = "\n".join(suspicious_lines)
                 
                 prompt = (
-                    "You are a strict parental media filter. Read the following numbered movie subtitle lines. "
-                    "Identify lines containing severe profanity, explicit sexual innuendo, or graphic visual descriptions in brackets. "
-                    "Ignore mild words or non-explicit words (like pounding on a door). "
+                    "You are a strict parental media filter. Read these specific numbered subtitle lines. "
+                    "Identify ONLY the lines containing actual severe profanity, explicit sexual innuendo, or graphic visual descriptions in brackets. "
+                    "Ignore mild words or non-explicit action (e.g. [pounding on door] or names like Dick). "
                     "Return ONLY a raw JSON array of the integers matching the line numbers that violate this policy. "
                     "Do not return any other text. Example: [15, 89, 102]\n\n"
-                    f"{full_script}"
+                    f"{script_chunk}"
                 )
 
                 headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-                
-                # FIXED: Upgraded to 3.1 8B Instant (128,000 token limit) to prevent 400 Bad Request
+                # Shifted to the stable 8b-instant model now that we are safely chunking the tokens
                 payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
                 
-                response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=60)
+                response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
                 response.raise_for_status()
                 
                 ai_text = response.json()["choices"][0]["message"]["content"]
                 match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
                 if match:
                     bad_indices = json.loads(match.group(0))
-                    print(f"✅ AI SUCCESS: Groq found {len(bad_indices)} violating lines.")
+                    print(f"✅ AI SUCCESS: Groq validated {len(bad_indices)} true violations.")
                     for idx in bad_indices:
                         if 0 <= idx < len(subs):
                             start_ms = max(0, subs[idx].start - BUFFER_MS + platform_offset)
@@ -209,13 +218,15 @@ def report_title(req: ReportRequest):
                     ai_success = True
             except Exception as e:
                 print(f"⚠️ Groq AI Failed ({e}). Falling back to Regex!")
-        else:
+        elif not GROQ_API_KEY:
             print("⚠️ GROQ_API_KEY missing. Bypassing AI Engine.")
 
         # --- LAYER 2: REGEX FALLBACK ---
         if not ai_success:
             print("⚙️ Running standard Regex Engine...")
-            for sub in subs:
+            for idx_str in suspicious_lines:
+                idx = int(idx_str.split("|")[0])
+                sub = subs[idx]
                 start_ms = max(0, sub.start - BUFFER_MS + platform_offset)
                 end_ms = sub.end + BUFFER_MS + platform_offset
                 text = sub.plaintext
