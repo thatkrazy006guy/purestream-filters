@@ -15,19 +15,19 @@ app = FastAPI()
 # --- CLOUD CONFIGURATION ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # AI Context Engine Key
 GIST_ID = os.getenv("GIST_ID", "26c5299781dfbc13015947ebff5a6e66")
 
-# --- PLATFORM PRE-ROLL OFFSETS (in Milliseconds) ---
 PLATFORM_OFFSETS = {
-    "com.wbd.stream": 7000,                     # Max / HBO Max
-    "com.hbo.hbonow": 7000,                     # Legacy HBO
-    "com.hulu.livingroomplus": 4000,            # Hulu
-    "com.disney.disneyplus": 5000,              # Disney+
-    "com.amazon.amazonvideo.livingroom": 2000,  # Prime Video
-    "com.netflix.ninja": 0                      # Netflix (Standard)
+    "com.wbd.stream": 7000,
+    "com.hbo.hbonow": 7000,
+    "com.hulu.livingroomplus": 4000,
+    "com.disney.disneyplus": 5000,
+    "com.amazon.amazonvideo.livingroom": 2000,
+    "com.netflix.ninja": 0
 }
 
-# --- TRIGGER LISTS ---
+# --- REGEX FALLBACK LISTS ---
 EXPLICIT_WORDS = [
     "fuck", "fucking", "fucked", "fucker", "motherfucker",
     "shit", "shitty", "bullshit", "bitch", "bitches", "bitching",
@@ -67,14 +67,13 @@ def merge_zones(zones):
     return merged
 
 def fetch_imdb_advisories(title, tmdb_api_key):
-    """Scrapes exact Nudity/Drugs/Violence severities from IMDb Parents Guide."""
-    if not tmdb_api_key: return {}
+    """Scrapes Nudity/Drugs/Violence severities from IMDb Parents Guide."""
+    if not tmdb_api_key: return {}, None
     try:
-        # 1. Use TMDB to securely find the official IMDb ID
         clean_title = re.sub(r'\s*S\d+E\d+.*', '', title, flags=re.IGNORECASE).strip()
         tmdb_url = f"https://api.themoviedb.org/3/search/multi?api_key={tmdb_api_key}&query={clean_title}"
         results = requests.get(tmdb_url).json().get("results", [])
-        if not results: return {}
+        if not results: return {}, None
         
         media_item = results[0]
         media_id = media_item["id"]
@@ -82,9 +81,8 @@ def fetch_imdb_advisories(title, tmdb_api_key):
         
         ext_url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/external_ids?api_key={tmdb_api_key}"
         imdb_id = requests.get(ext_url).json().get("imdb_id")
-        if not imdb_id: return {}
+        if not imdb_id: return {}, None
         
-        # 2. Scrape the live IMDb HTML 
         pg_url = f"https://www.imdb.com/title/{imdb_id}/parentalguide"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         res = requests.get(pg_url, headers=headers)
@@ -93,53 +91,37 @@ def fetch_imdb_advisories(title, tmdb_api_key):
         categories = ["Sex & Nudity", "Violence & Gore", "Profanity", "Alcohol, Drugs & Smoking", "Frightening & Intense Scenes"]
         
         for cat in categories:
-            # Dynamically scan the HTML for the community severity tags
             pattern = re.compile(fr'{re.escape(cat)}.{'{0,500}'}?(None|Mild|Moderate|Severe)', re.IGNORECASE | re.DOTALL)
             match = pattern.search(res.text)
             if match:
                 advisories[cat] = match.group(1).title()
                 
-        return advisories
+        return advisories, imdb_id
     except Exception as e:
         print(f"IMDb Scraper Error: {e}")
-        return {}
+        return {}, None
 
 def fetch_community_edl(imdb_id):
-    """
-    Scrapes open-source EDL (Edit Decision List) repositories for community-sourced 
-    visual skips (nudity, gore) that subtitles cannot detect.
-    """
+    """Scrapes open-source EDL repositories for community visual skips."""
     if not imdb_id: return []
-    
-    # Example: A centralized GitHub repository URL where community EDL files are hosted.
-    # (You can replace this with a specific community repo or a secondary Gist of your own)
+    # Placeholder for a community repo URL. You can map this to any raw GitHub repository hosting .edl files
     edl_repo_url = f"https://raw.githubusercontent.com/PureStreamCommunity/EDL-Database/main/movies/{imdb_id}.edl"
-    
     try:
         res = requests.get(edl_repo_url, timeout=3)
-        if res.status_code != 200:
-            return []
+        if res.status_code != 200: return []
             
         community_zones = []
         for line in res.text.splitlines():
             line = line.strip()
             if not line or line.startswith("#"): continue
-            
-            # EDL Format: start_time end_time action (0 = skip visual, 1 = mute audio)
             parts = line.split()
             if len(parts) >= 3:
                 start_ms = int(float(parts[0]) * 1000)
                 end_ms = int(float(parts[1]) * 1000)
                 action = "profanity" if parts[2] == "1" else "explicit"
-                
-                community_zones.append({
-                    "startTimeMs": start_ms, 
-                    "endTimeMs": end_ms, 
-                    "skipType": action
-                })
+                community_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": action})
         return community_zones
-    except Exception as e:
-        print(f"EDL Fetch Error: {e}")
+    except:
         return []
 
 @app.get("/")
@@ -155,13 +137,10 @@ def report_title(req: ReportRequest):
     if req.media_type == "tv" and req.season and req.episode:
         formatted_title = f"{req.title} S{req.season:02d}E{req.episode:02d}"
 
-    # Determine studio logo delay for the active app
     platform_offset = PLATFORM_OFFSETS.get(req.package_name, 0)
-
     search_queries = [formatted_title]
     base_title = re.sub(r'\s*S\d+E\d+.*', '', formatted_title, flags=re.IGNORECASE).strip()
-    if base_title != formatted_title and base_title not in search_queries:
-        search_queries.append(base_title)
+    if base_title != formatted_title: search_queries.append(base_title)
 
     if TMDB_API_KEY:
         try:
@@ -170,76 +149,106 @@ def report_title(req: ReportRequest):
                 official = item.get("title") or item.get("name")
                 if official and official not in search_queries:
                     search_queries.append(official)
-        except Exception:
-            pass
+        except: pass
 
     with tempfile.TemporaryDirectory() as temp_dir:
         found_subs = []
-        
         for query in search_queries:
             clean_query = re.sub(r'[\\/:*?"<>|]', '', query).strip()
             dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.WEB-DL.mp4")
             open(dummy_mp4, "w").close()
-            
             subprocess.run(["subliminal", "download", "-l", "en", dummy_mp4])
-
             for file in os.listdir(temp_dir):
                 if file.startswith(clean_query) and not file.endswith(".mp4"):
                     found_subs.append(os.path.join(temp_dir, file))
-            
-            if found_subs:
-                print(f"Success! Found subs using alias: {query}")
-                break
+            if found_subs: break
 
         if not found_subs:
-            return {"status": "pending", "message": f"No subtitles found online for any alias of {formatted_title}."}
+            return {"status": "pending", "message": f"No subtitles found for {formatted_title}."}
 
         try:
             subs = pysubs2.load(found_subs[0], encoding='utf-8')
-        except Exception:
-            try:
-                subs = pysubs2.load(found_subs[0], encoding='iso-8859-1')
-            except Exception:
-                return {"status": "error", "message": "Failed to parse subtitle file."}
+        except:
+            try: subs = pysubs2.load(found_subs[0], encoding='iso-8859-1')
+            except: return {"status": "error", "message": "Failed to parse subtitle file."}
 
         profanity_zones = []
         explicit_zones = []
+        
+        # --- LAYER 1: GROQ AI CONTEXT ENGINE ---
+        ai_success = False
+        if GROQ_API_KEY:
+            try:
+                print("Attempting Groq AI analysis...")
+                sub_lines = []
+                for i, sub in enumerate(subs):
+                    clean_text = sub.plaintext.replace('\n', ' ').strip()
+                    sub_lines.append(f"{i}|{clean_text}")
+                
+                full_script = "\n".join(sub_lines)
+                
+                prompt = (
+                    "You are a strict parental media filter. Read the following numbered movie subtitle lines. "
+                    "Identify lines containing severe profanity, explicit sexual innuendo, or graphic visual descriptions in brackets. "
+                    "Ignore mild words (like hell, damn) or non-explicit words (like pounding on a door). "
+                    "Return ONLY a raw JSON array of the integers matching the line numbers that violate this policy. "
+                    "Do not return any other text, markdown, or explanation. Example: [15, 89, 102]\n\n"
+                    f"{full_script}"
+                )
 
-        for sub in subs:
-            # Apply platform-specific intro offset + buffer
-            start_ms = max(0, sub.start - BUFFER_MS + platform_offset)
-            end_ms = sub.end + BUFFER_MS + platform_offset
-            text = sub.plaintext
+                headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+                payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+                
+                response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                
+                ai_text = response.json()["choices"][0]["message"]["content"]
+                match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
+                if match:
+                    bad_indices = json.loads(match.group(0))
+                    print(f"Groq AI successfully found {len(bad_indices)} violating lines.")
+                    for idx in bad_indices:
+                        if 0 <= idx < len(subs):
+                            start_ms = max(0, subs[idx].start - BUFFER_MS + platform_offset)
+                            end_ms = subs[idx].end + BUFFER_MS + platform_offset
+                            profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+                    ai_success = True
+            except Exception as e:
+                print(f"Groq AI Failed ({e}). Falling back to Regex Engine!")
 
-            if EXPLICIT_REGEX.search(text):
-                explicit_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "explicit"})
+        # --- LAYER 2: REGEX FALLBACK ENGINE ---
+        if not ai_success:
+            print("Running Regex fallback engine...")
+            for sub in subs:
+                start_ms = max(0, sub.start - BUFFER_MS + platform_offset)
+                end_ms = sub.end + BUFFER_MS + platform_offset
+                text = sub.plaintext
 
-            spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
-            if PROFANITY_REGEX.search(spoken_text):
-                profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+                if EXPLICIT_REGEX.search(text):
+                    explicit_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "explicit"})
 
-        all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones)
+                spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
+                if PROFANITY_REGEX.search(spoken_text):
+                    profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+
+        # --- LAYER 3: IMDb & COMMUNITY EDL ---
+        imdb_advisories, imdb_id = fetch_imdb_advisories(formatted_title, TMDB_API_KEY)
+        community_zones = fetch_community_edl(imdb_id)
+        
+        all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        # Layer 1: Subtitle-based Advisories
         advisories_map = {}
-        if any(z["skipType"] == "profanity" for z in all_zones):
-            advisories_map["Profanity"] = "Severe"
-        if any(z["skipType"] == "explicit" for z in all_zones):
-            advisories_map["Nudity & Explicit Content"] = "Moderate"
+        if any(z["skipType"] == "profanity" for z in all_zones): advisories_map["Profanity"] = "Severe"
+        if any(z["skipType"] == "explicit" for z in all_zones): advisories_map["Nudity & Explicit Content"] = "Moderate"
 
-        # Layer 2: Scrape IMDb Parents Guide for community severities
-        imdb_advisories = fetch_imdb_advisories(formatted_title, TMDB_API_KEY)
-
-        # Merge them (IMDb community data overwrites the basic subtitle scan if there are duplicates)
         final_advisories = {**advisories_map, **imdb_advisories}
 
         gh = Github(GITHUB_TOKEN)
         gist = gh.get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
         
-        raw_url = gist.files[gist_file].raw_url
-        db_data = requests.get(raw_url).json()
+        db_data = requests.get(gist.files[gist_file].raw_url).json()
 
         db_data[formatted_title] = {
             "skipZones": all_zones,
@@ -249,7 +258,7 @@ def report_title(req: ReportRequest):
         new_content = json.dumps(db_data, separators=(',', ':'))
         gist.edit(files={gist_file: InputFileContent(content=new_content)})
 
-    return {"status": "success", "title": formatted_title, "zones_added": len(all_zones), "platform_offset_ms": platform_offset}
+    return {"status": "success", "title": formatted_title, "zones_added": len(all_zones), "platform_offset_ms": platform_offset, "ai_used": ai_success}
 
 last_scraped_title = ""
 LIVE_EXCLUSIONS = ["wwe raw", "wwe smackdown", "wwe nxt", "wwe", "netflix live", "live from"]
@@ -268,7 +277,6 @@ def netflix_sync():
 
     cookie_header = f"SecureNetflixId={cookie_val}" if "=" not in cookie_val else cookie_val
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": cookie_header}
-
     latest_title = None
 
     try:
@@ -281,8 +289,7 @@ def netflix_sync():
                 activity_title = first_title_tag.text.strip()
                 if not any(ex in activity_title.lower() for ex in LIVE_EXCLUSIONS):
                     latest_title = activity_title
-    except Exception:
-        pass
+    except Exception: pass
 
     if latest_title == last_scraped_title or not latest_title:
         try:
@@ -294,13 +301,11 @@ def netflix_sync():
                 raw_titles = re.findall(r'"title":"(.*?)"', cw_chunk)
                 for raw_t in raw_titles:
                     cw_title = raw_t.encode('utf-8').decode('unicode_escape').strip()
-                    if any(exclusion in cw_title.lower() for exclusion in LIVE_EXCLUSIONS):
-                        continue
+                    if any(exclusion in cw_title.lower() for exclusion in LIVE_EXCLUSIONS): continue
                     if cw_title and cw_title != last_scraped_title:
                         latest_title = cw_title
                         break
-        except Exception:
-            pass
+        except Exception: pass
 
     if latest_title and latest_title != last_scraped_title:
         last_scraped_title = latest_title
@@ -318,8 +323,7 @@ def delete_movie(title: str):
         
         keys_to_delete = [k for k in db_data.keys() if title.lower() in k.lower()]
         if keys_to_delete:
-            for k in keys_to_delete:
-                del db_data[k]
+            for k in keys_to_delete: del db_data[k]
             gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
             return {"status": "success", "message": f"Deleted: {keys_to_delete}"}
         return {"status": "error", "message": f"No entry containing '{title}' found."}
