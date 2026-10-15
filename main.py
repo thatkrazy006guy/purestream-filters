@@ -187,7 +187,8 @@ def report_title(req: ReportRequest):
             try:
                 models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
                 if models_res.status_code == 200:
-                    fetched_models = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower()]
+                    # STRICT FIX: Only allow highly accurate Llama models. Reject Qwen, Gemma, Mixtral.
+                    fetched_models = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower() and "llama" in m["id"].lower()]
                     for m in fetched_models:
                         if m not in active_models: active_models.append(m)
             except: pass
@@ -336,3 +337,13 @@ def shift_sync(title: str, offset_ms: int):
         gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
         return {"status": "success", "message": f"Shifted {keys} by {offset_ms}ms"}
     except Exception as e: return {"status": "error", "message": str(e)}
+        
+ @app.get("/api/db")
+def view_database():
+    try:
+        gh = Github(GITHUB_TOKEN)
+        gist = gh.get_gist(GIST_ID)
+        gist_file = list(gist.files.keys())[0]
+        return requests.get(gist.files[gist_file].raw_url).json()
+    except Exception as e:
+        return {"error": str(e)}       
