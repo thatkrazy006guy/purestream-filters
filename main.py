@@ -167,7 +167,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (Sanity-Checked) ---
+        # --- LAYER 1: GROQ AI ENGINE (Sanity-Checked & Llama-Only) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -181,13 +181,11 @@ def report_title(req: ReportRequest):
             )
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
-            # Anti-Sabotage 1: Force Llama models to the absolute front of the line
             preferred_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
             active_models = preferred_models.copy()
             try:
                 models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
                 if models_res.status_code == 200:
-                    # STRICT FIX: Only allow highly accurate Llama models. Reject Qwen, Gemma, Mixtral.
                     fetched_models = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower() and "llama" in m["id"].lower()]
                     for m in fetched_models:
                         if m not in active_models: active_models.append(m)
@@ -204,11 +202,10 @@ def report_title(req: ReportRequest):
                         if match:
                             bad_indices = json.loads(match.group(0))
                             
-                            # Anti-Sabotage 2: Sanity check the AI's math
                             if len(bad_indices) == 0 and len(suspicious_lines) > 0:
                                 print(f"⚠️ Groq ({model}) hallucinated 0 violations. Rejecting AI response.")
                                 ai_success = False 
-                                break # Exit the model loop, force Regex
+                                break 
                                 
                             print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                             for idx in bad_indices:
@@ -248,7 +245,6 @@ def report_title(req: ReportRequest):
         if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
         if any(z["skipType"] == "explicit" for z in all_zones): final_advisories["Nudity & Explicit Content"] = "Moderate"
 
-        # --- Anti-Sabotage 3: The Data Protector ---
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -257,11 +253,10 @@ def report_title(req: ReportRequest):
                 gist_file = list(gist.files.keys())[0]
                 db_data = requests.get(gist.files[gist_file].raw_url).json()
 
-                # Protect against overwriting a perfectly good scrape with a blank scrape
                 existing_zones = db_data.get(formatted_title, {}).get("skipZones", [])
                 if len(all_zones) == 0 and len(existing_zones) > 0:
                     print("🛡️ Anti-Overwrite Protocol: Prevented an empty scan from wiping out existing database zones.")
-                    break # Stop saving, keep the good data
+                    break
 
                 db_data[formatted_title] = {"skipZones": all_zones, "advisories": final_advisories}
                 gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
@@ -337,8 +332,8 @@ def shift_sync(title: str, offset_ms: int):
         gist.edit(files={gist_file: InputFileContent(content=json.dumps(db_data, separators=(',', ':')))})
         return {"status": "success", "message": f"Shifted {keys} by {offset_ms}ms"}
     except Exception as e: return {"status": "error", "message": str(e)}
-        
- @app.get("/api/db")
+
+@app.get("/api/db")
 def view_database():
     try:
         gh = Github(GITHUB_TOKEN)
@@ -346,4 +341,4 @@ def view_database():
         gist_file = list(gist.files.keys())[0]
         return requests.get(gist.files[gist_file].raw_url).json()
     except Exception as e:
-        return {"error": str(e)}       
+        return {"error": str(e)}
