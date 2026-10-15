@@ -43,7 +43,9 @@ VISUAL_CUES = [
 ]
 EXPLICIT_REGEX = re.compile(r'[\[\(].*?\b(?:' + '|'.join(VISUAL_CUES) + r')\b.*?[\]\)]', re.IGNORECASE)
 
-BUFFER_MS = 500
+# --- ASYMMETRIC BUFFER TIMINGS ---
+START_BUFFER_MS = 300   # Tight start buffer to avoid cutting preceding dialogue
+END_BUFFER_MS = 1000    # Extended tail buffer to prevent word end leaks
 
 class ReportRequest(BaseModel):
     tmdb_id: int = 0
@@ -225,8 +227,8 @@ def report_title(req: ReportRequest):
                             print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                             for idx in bad_indices:
                                 if 0 <= idx < len(subs):
-                                    start_ms = max(0, subs[idx].start - BUFFER_MS + platform_offset)
-                                    end_ms = subs[idx].end + BUFFER_MS + platform_offset
+                                    start_ms = max(0, sub.start - START_BUFFER_MS + platform_offset)
+                                    end_ms = sub.end + END_BUFFER_MS + platform_offset
                                     profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
                             ai_success = True
                             break
@@ -238,8 +240,11 @@ def report_title(req: ReportRequest):
             for idx_str in suspicious_lines:
                 idx = int(idx_str.split("|")[0])
                 sub = subs[idx]
-                start_ms = max(0, sub.start - BUFFER_MS + platform_offset)
-                end_ms = sub.end + BUFFER_MS + platform_offset
+                
+                # Apply the asymmetric buffers here too!
+                start_ms = max(0, sub.start - START_BUFFER_MS + platform_offset)
+                end_ms = sub.end + END_BUFFER_MS + platform_offset
+                
                 text = sub.plaintext
                 if EXPLICIT_REGEX.search(text): explicit_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "explicit"})
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
