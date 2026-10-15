@@ -84,6 +84,28 @@ def fetch_tmdb_rating(media_id, media_type, api_key):
     except: pass
     return ""
 
+def fetch_tmdb_keywords(media_id, media_type, api_key):
+    """SURE-FIRE FIX: Exploits hidden TMDB metadata tags to find Nudity & Drugs without scraping websites."""
+    if not api_key or not media_id: return {}
+    try:
+        url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/keywords?api_key={api_key}"
+        res = requests.get(url, timeout=5).json()
+        keywords_list = res.get("keywords", []) if media_type == "movie" else res.get("results", [])
+        
+        advisories = {}
+        for kw in keywords_list:
+            name = kw.get("name", "").lower()
+            if "nudity" in name or "sex" in name or "erotic" in name:
+                advisories["Nudity & Sexual Content"] = "Severe"
+            if "drug" in name or "narcotic" in name or "marijuana" in name or "stoner" in name:
+                advisories["Drugs & Alcohol"] = "Severe"
+            if "gore" in name or "blood" in name or "murder" in name or "violence" in name:
+                advisories["Violence & Gore"] = "Severe"
+        return advisories
+    except Exception as e:
+        print(f"⚠️ TMDB Keywords Error: {e}")
+        return {}
+
 def fetch_community_edl(imdb_id):
     if not imdb_id: return []
     edl_repo_url = f"https://raw.githubusercontent.com/PureStreamCommunity/EDL-Database/main/movies/{imdb_id}.edl"
@@ -167,7 +189,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (Sanity-Checked & Llama-Only) ---
+        # --- LAYER 1: GROQ AI ENGINE ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -201,12 +223,10 @@ def report_title(req: ReportRequest):
                         match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
                         if match:
                             bad_indices = json.loads(match.group(0))
-                            
                             if len(bad_indices) == 0 and len(suspicious_lines) > 0:
                                 print(f"⚠️ Groq ({model}) hallucinated 0 violations. Rejecting AI response.")
                                 ai_success = False 
                                 break 
-                                
                             print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                             for idx in bad_indices:
                                 if 0 <= idx < len(subs):
@@ -233,17 +253,20 @@ def report_title(req: ReportRequest):
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
                 if PROFANITY_REGEX.search(spoken_text): profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
 
-        # --- LAYER 3: OFFICIAL RATING & COMMUNITY MERGE ---
+        # --- LAYER 3: KEYWORDS & COMMUNITY MERGE ---
         tmdb_certification = fetch_tmdb_rating(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
+        tmdb_keywords = fetch_tmdb_keywords(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
         community_zones = fetch_community_edl(imdb_id)
         
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        final_advisories = {}
+        # Construct final warnings based on metadata and detected zones
+        final_advisories = {**tmdb_keywords}
         if tmdb_certification: final_advisories["Official Rating"] = tmdb_certification
         if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
-        if any(z["skipType"] == "explicit" for z in all_zones): final_advisories["Nudity & Explicit Content"] = "Moderate"
+        if any(z["skipType"] == "explicit" for z in all_zones) and "Nudity & Sexual Content" not in final_advisories:
+            final_advisories["Nudity & Explicit Content"] = "Moderate"
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -336,9 +359,7 @@ def shift_sync(title: str, offset_ms: int):
 @app.get("/api/db")
 def view_database():
     try:
-        gh = Github(GITHUB_TOKEN)
-        gist = gh.get_gist(GIST_ID)
+        gh, gist = Github(GITHUB_TOKEN), Github(GITHUB_TOKEN).get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
         return requests.get(gist.files[gist_file].raw_url).json()
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as e: return {"error": str(e)}
