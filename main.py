@@ -85,7 +85,6 @@ def fetch_tmdb_rating(media_id, media_type, api_key):
     return ""
 
 def fetch_tmdb_keywords(media_id, media_type, api_key):
-    """SURE-FIRE FIX: Exploits hidden TMDB metadata tags to find Nudity & Drugs without scraping websites."""
     if not api_key or not media_id: return {}
     try:
         url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/keywords?api_key={api_key}"
@@ -97,14 +96,12 @@ def fetch_tmdb_keywords(media_id, media_type, api_key):
             name = kw.get("name", "").lower()
             if "nudity" in name or "sex" in name or "erotic" in name:
                 advisories["Nudity & Sexual Content"] = "Severe"
-            if "drug" in name or "narcotic" in name or "marijuana" in name or "stoner" in name:
+            if "drug" in name or "narcotic" in name or "marijuana" in name or "stoner" in name or "alcohol" in name:
                 advisories["Drugs & Alcohol"] = "Severe"
             if "gore" in name or "blood" in name or "murder" in name or "violence" in name:
                 advisories["Violence & Gore"] = "Severe"
         return advisories
-    except Exception as e:
-        print(f"⚠️ TMDB Keywords Error: {e}")
-        return {}
+    except: return {}
 
 def fetch_community_edl(imdb_id):
     if not imdb_id: return []
@@ -189,7 +186,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE ---
+        # --- LAYER 1: GROQ AI ENGINE (Hardcoded Stable Llama Models) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -203,17 +200,10 @@ def report_title(req: ReportRequest):
             )
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
-            preferred_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
-            active_models = preferred_models.copy()
-            try:
-                models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
-                if models_res.status_code == 200:
-                    fetched_models = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower() and "llama" in m["id"].lower()]
-                    for m in fetched_models:
-                        if m not in active_models: active_models.append(m)
-            except: pass
+            # Hardcode stable production models only—no experimental wrappers
+            stable_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
             
-            for model in active_models:
+            for model in stable_models:
                 try:
                     payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
                     response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
@@ -223,10 +213,15 @@ def report_title(req: ReportRequest):
                         match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
                         if match:
                             bad_indices = json.loads(match.group(0))
+                            
                             if len(bad_indices) == 0 and len(suspicious_lines) > 0:
                                 print(f"⚠️ Groq ({model}) hallucinated 0 violations. Rejecting AI response.")
-                                ai_success = False 
-                                break 
+                                continue
+                                
+                            if len(bad_indices) > 100: # Safety cap against runaway hallucinations
+                                print(f"⚠️ Groq ({model}) returned {len(bad_indices)} flags (suspected hallucination). Falling back to Regex.")
+                                break
+                                
                             print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                             for idx in bad_indices:
                                 if 0 <= idx < len(subs):
@@ -236,9 +231,6 @@ def report_title(req: ReportRequest):
                             ai_success = True
                             break
                 except: pass
-            
-            if not ai_success:
-                print("⚠️ AI failed sanity check or network limits. Bypassing AI Engine.")
         
         # --- LAYER 2: REGEX FALLBACK ---
         if not ai_success:
@@ -253,7 +245,7 @@ def report_title(req: ReportRequest):
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
                 if PROFANITY_REGEX.search(spoken_text): profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
 
-        # --- LAYER 3: KEYWORDS & COMMUNITY MERGE ---
+        # --- LAYER 3: OFFICIAL RATING & KEYWORDS MERGE ---
         tmdb_certification = fetch_tmdb_rating(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
         tmdb_keywords = fetch_tmdb_keywords(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
         community_zones = fetch_community_edl(imdb_id)
@@ -261,7 +253,6 @@ def report_title(req: ReportRequest):
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        # Construct final warnings based on metadata and detected zones
         final_advisories = {**tmdb_keywords}
         if tmdb_certification: final_advisories["Official Rating"] = tmdb_certification
         if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
@@ -359,7 +350,7 @@ def shift_sync(title: str, offset_ms: int):
 @app.get("/api/db")
 def view_database():
     try:
-        gh, gist = Github(GITHUB_TOKEN), Github(GITHUB_TOKEN).get_gist(GIST_ID)
+        gh = Github(GITHUB_TOKEN), Github(GITHUB_TOKEN).get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
         return requests.get(gist.files[gist_file].raw_url).json()
     except Exception as e: return {"error": str(e)}
