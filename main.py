@@ -27,6 +27,10 @@ PLATFORM_OFFSETS = {
     "com.netflix.ninja": 0
 }
 
+# --- ASYMMETRIC BUFFERS ---
+START_BUFFER_MS = 300
+END_BUFFER_MS = 1000
+
 EXPLICIT_WORDS = [
     "fuck", "fucking", "fucked", "fucker", "motherfucker",
     "shit", "shitty", "bullshit", "bitch", "bitches", "bitching",
@@ -42,10 +46,6 @@ VISUAL_CUES = [
     "kissing", "smooching"
 ]
 EXPLICIT_REGEX = re.compile(r'[\[\(].*?\b(?:' + '|'.join(VISUAL_CUES) + r')\b.*?[\]\)]', re.IGNORECASE)
-
-# --- ASYMMETRIC BUFFER TIMINGS ---
-START_BUFFER_MS = 300   # Tight start buffer to avoid cutting preceding dialogue
-END_BUFFER_MS = 1000    # Extended tail buffer to prevent word end leaks
 
 class ReportRequest(BaseModel):
     tmdb_id: int = 0
@@ -188,7 +188,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (Hardcoded Stable Llama Models) ---
+        # --- LAYER 1: GROQ AI ENGINE ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -201,8 +201,6 @@ def report_title(req: ReportRequest):
                 f"{script_chunk}"
             )
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            
-            # Hardcode stable production models only—no experimental wrappers
             stable_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
             
             for model in stable_models:
@@ -215,24 +213,25 @@ def report_title(req: ReportRequest):
                         match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
                         if match:
                             bad_indices = json.loads(match.group(0))
-                            
                             if len(bad_indices) == 0 and len(suspicious_lines) > 0:
-                                print(f"⚠️ Groq ({model}) hallucinated 0 violations. Rejecting AI response.")
+                                print(f"⚠️ Groq ({model}) hallucinated 0 violations.")
                                 continue
-                                
-                            if len(bad_indices) > 100: # Safety cap against runaway hallucinations
-                                print(f"⚠️ Groq ({model}) returned {len(bad_indices)} flags (suspected hallucination). Falling back to Regex.")
+                            if len(bad_indices) > 100:
+                                print(f"⚠️ Groq ({model}) hallucinated runaway flags.")
                                 break
                                 
                             print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                             for idx in bad_indices:
                                 if 0 <= idx < len(subs):
-                                    start_ms = max(0, sub.start - START_BUFFER_MS + platform_offset)
-                                    end_ms = sub.end + END_BUFFER_MS + platform_offset
+                                    start_ms = max(0, subs[idx].start - START_BUFFER_MS + platform_offset)
+                                    end_ms = subs[idx].end + END_BUFFER_MS + platform_offset
                                     profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
                             ai_success = True
                             break
-                except: pass
+                    else:
+                        print(f"⚠️ Groq ({model}) API Error {response.status_code}: {response.text}")
+                except Exception as e:
+                    print(f"⚠️ Groq ({model}) Exception: {e}")
         
         # --- LAYER 2: REGEX FALLBACK ---
         if not ai_success:
@@ -240,11 +239,8 @@ def report_title(req: ReportRequest):
             for idx_str in suspicious_lines:
                 idx = int(idx_str.split("|")[0])
                 sub = subs[idx]
-                
-                # Apply the asymmetric buffers here too!
                 start_ms = max(0, sub.start - START_BUFFER_MS + platform_offset)
                 end_ms = sub.end + END_BUFFER_MS + platform_offset
-                
                 text = sub.plaintext
                 if EXPLICIT_REGEX.search(text): explicit_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "explicit"})
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
@@ -355,7 +351,9 @@ def shift_sync(title: str, offset_ms: int):
 @app.get("/api/db")
 def view_database():
     try:
-        gh = Github(GITHUB_TOKEN), Github(GITHUB_TOKEN).get_gist(GIST_ID)
+        gh = Github(GITHUB_TOKEN)
+        gist = gh.get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
         return requests.get(gist.files[gist_file].raw_url).json()
-    except Exception as e: return {"error": str(e)}
+    except Exception as e: 
+        return {"error": str(e)}
