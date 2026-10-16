@@ -18,13 +18,13 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GIST_ID = os.getenv("GIST_ID", "26c5299781dfbc13015947ebff5a6e66").strip()
 
-PLATFORM_OFFSETS = {
-    "com.wbd.stream": 0,
-    "com.hbo.hbonow": 0,
-    "com.hulu.livingroomplus": 0,
-    "com.disney.disneyplus": 0,
-    "com.amazon.amazonvideo.livingroom": 0,
-    "com.netflix.ninja": 0
+PLATFORM_TAGS = {
+    "com.wbd.stream": "MAX",
+    "com.hbo.hbonow": "HBO",
+    "com.hulu.livingroomplus": "HULU",
+    "com.disney.disneyplus": "DSNP",
+    "com.amazon.amazonvideo.livingroom": "AMZN",
+    "com.netflix.ninja": "NF"
 }
 
 # --- ASYMMETRIC BUFFERS ---
@@ -159,11 +159,16 @@ def report_title(req: ReportRequest):
                 imdb_id = requests.get(ext_url, timeout=5).json().get("imdb_id")
         except: pass
 
+    platform_tag = PLATFORM_TAGS.get(req.package_name, "AMZN") # Default to AMZN if app is unknown
+
     with tempfile.TemporaryDirectory() as temp_dir:
         found_subs = []
         for query in search_queries:
             clean_query = re.sub(r'[\\/:*?"<>|]', '', query).strip()
-            dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.WEB-DL.mp4")
+            
+            # AUTONOMOUS SYNC: Force scraper to fetch the exact subtitle for the specific streaming app
+            dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.{platform_tag}.WEB-DL.mp4")
+            
             open(dummy_mp4, "w").close()
             subprocess.run(["subliminal", "download", "-l", "en", dummy_mp4], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for file in os.listdir(temp_dir):
