@@ -44,9 +44,15 @@ VISUAL_CUES = [
     "moan", "moaning", "moans", "panting", "pants",
     "breathing heavily", "heavy breathing", "grunting", "grunts",
     "bed springs", "squeaking", "flesh slapping", "slapping",
-    "kissing", "smooching"
+    "kissing", "smooching", "undressing", "taking off clothes", "naked", "topless"
 ]
 EXPLICIT_REGEX = re.compile(r'[\[\(].*?\b(?:' + '|'.join(VISUAL_CUES) + r')\b.*?[\]\)]', re.IGNORECASE)
+
+DRUG_WORDS = [
+    "cocaine", "weed", "marijuana", "meth", "heroin", "fentanyl", 
+    "lsd", "shrooms", "crack", "snorting", "smoking joint", "blunt"
+]
+DRUG_REGEX = re.compile(r'\b(?:' + '|'.join(DRUG_WORDS) + r')\b', re.IGNORECASE)
 
 class ReportRequest(BaseModel):
     tmdb_id: int = 0
@@ -86,25 +92,6 @@ def fetch_tmdb_rating(media_id, media_type, api_key):
                     return result.get("rating", "")
     except: pass
     return ""
-
-def fetch_tmdb_keywords(media_id, media_type, api_key):
-    if not api_key or not media_id: return {}
-    try:
-        url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/keywords?api_key={api_key}"
-        res = requests.get(url, timeout=5).json()
-        keywords_list = res.get("keywords", []) if media_type == "movie" else res.get("results", [])
-        
-        advisories = {}
-        for kw in keywords_list:
-            name = kw.get("name", "").lower()
-            if "nudity" in name or "sex" in name or "erotic" in name:
-                advisories["Nudity & Sexual Content"] = "Severe"
-            if "drug" in name or "narcotic" in name or "marijuana" in name or "stoner" in name or "alcohol" in name:
-                advisories["Drugs & Alcohol"] = "Severe"
-            if "gore" in name or "blood" in name or "murder" in name or "violence" in name:
-                advisories["Violence & Gore"] = "Severe"
-        return advisories
-    except: return {}
 
 def fetch_community_edl(imdb_id):
     if not imdb_id: return []
@@ -162,8 +149,7 @@ def report_title(req: ReportRequest):
                 
                 ext_url = f"https://api.themoviedb.org/3/{tmdb_media_type}/{tmdb_media_id}/external_ids?api_key={TMDB_API_KEY}"
                 imdb_id = requests.get(ext_url, timeout=5).json().get("imdb_id")
-        except Exception as e: 
-            print(f"⚠️ TMDB Search Error: {e}")
+        except: pass
 
     with tempfile.TemporaryDirectory() as temp_dir:
         found_subs = []
@@ -187,14 +173,20 @@ def report_title(req: ReportRequest):
             except: return {"status": "error", "message": "Failed to parse subtitle file."}
 
         profanity_zones, explicit_zones, ai_success = [], [], False
-        
         suspicious_lines = []
+        drug_hit_count = 0
+        
         for i, sub in enumerate(subs):
             text = sub.plaintext.replace('\n', ' ').strip()
+            
+            # FOOLPROOF FIX: Native Drug Scanning in Subtitles
+            if DRUG_REGEX.search(text):
+                drug_hit_count += 1
+                
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (STRICT WHITELIST) ---
+        # --- LAYER 1: GROQ AI ENGINE (FOOLPROOF ROUTING) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -207,29 +199,26 @@ def report_title(req: ReportRequest):
                 "Example: {\"flags\": [15, 89, 102]}\n\n"
                 f"{script_chunk}"
             )
-            
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
-            # STRICT FIX: Block Prompt Guards and Experimental models
-            APPROVED_MODELS = [
-                "llama-3.3-70b-versatile",
-                "llama-3.1-8b-instant",
-                "mixtral-8x7b-32768"
-            ]
-            
+            # Dynamically grab the exact models your key has access to and filter out the junk
             active_models = []
             try:
                 models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
                 if models_res.status_code == 200:
-                    authorized = [m["id"] for m in models_res.json().get("data", [])]
-                    # Intersect approved models with authorized models to prevent 400 errors
-                    active_models = [m for m in APPROVED_MODELS if m in authorized]
-            except Exception as e:
-                print(f"⚠️ Model fetch failed: {e}")
+                    for m in models_res.json().get("data", []):
+                        mid = m["id"].lower()
+                        # Strictly ban prompt-guards, whisper audio, vision models, and tools
+                        if "whisper" not in mid and "guard" not in mid and "vision" not in mid and "tool" not in mid:
+                            active_models.append(m["id"])
+                    
+                    # Prioritize the most stable free models available
+                    active_models.sort(key=lambda x: 0 if 'llama3-8b' in x.lower() else 1 if 'gemma' in x.lower() else 2 if 'mixtral' in x.lower() else 3)
+            except: pass
             
             if not active_models:
-                active_models = ["llama-3.1-8b-instant"] # Ultimate fallback if fetch fails
-            
+                active_models = ["llama3-8b-8192", "gemma2-9b-it", "mixtral-8x7b-32768"]
+                
             for model in active_models:
                 try:
                     payload = {
@@ -246,11 +235,12 @@ def report_title(req: ReportRequest):
                         bad_indices = json_data.get("flags", [])
                         
                         if len(bad_indices) == 0:
-                            print(f"⚠️ Groq ({model}) found 0 violations. Rejecting AI response.")
-                            continue
+                            print(f"⚠️ Groq ({model}) found 0 violations. Trying next model...")
+                            continue # Try next model instead of giving up
+                            
                         if len(bad_indices) > len(suspicious_lines) * 0.4:
-                            print(f"⚠️ Groq ({model}) flagged {len(bad_indices)} items. Rejecting AI response.")
-                            break
+                            print(f"⚠️ Groq ({model}) hallucinated {len(bad_indices)} items. Trying next model...")
+                            continue # Try next model instead of giving up
                             
                         print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
                         for idx in bad_indices:
@@ -261,12 +251,12 @@ def report_title(req: ReportRequest):
                         ai_success = True
                         break
                     else:
-                        print(f"⚠️ Groq ({model}) rejected: {response.status_code}")
+                        print(f"⚠️ Groq ({model}) rejected: {response.status_code}. Trying next model...")
                 except Exception as e:
-                    print(f"⚠️ Groq ({model}) error: {e}")
+                    print(f"⚠️ Groq ({model}) error: {e}. Trying next model...")
             
             if not ai_success:
-                print("⚠️ AI failed sanity checks or network limits. Bypassing AI Engine.")
+                print("⚠️ All AI models failed or hallucinated. Bypassing AI Engine.")
         
         # --- LAYER 2: REGEX FALLBACK ---
         if not ai_success:
@@ -281,22 +271,21 @@ def report_title(req: ReportRequest):
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
                 if PROFANITY_REGEX.search(spoken_text): profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
 
-        # --- LAYER 3: OFFICIAL RATING & KEYWORDS MERGE ---
+        # --- LAYER 3: RATING & AUTONOMOUS ADVISORIES ---
         tmdb_certification = fetch_tmdb_rating(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
-        tmdb_keywords = fetch_tmdb_keywords(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
-        
-        print(f"🏷️ TMDB Advisories Generated: {tmdb_keywords}")
-        
         community_zones = fetch_community_edl(imdb_id)
         
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        final_advisories = {**tmdb_keywords}
+        final_advisories = {}
         if tmdb_certification: final_advisories["Official Rating"] = tmdb_certification
         if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
-        if any(z["skipType"] == "explicit" for z in all_zones) and "Nudity & Sexual Content" not in final_advisories:
-            final_advisories["Nudity & Explicit Content"] = "Moderate"
+        if any(z["skipType"] == "explicit" for z in all_zones): final_advisories["Nudity & Explicit Content"] = "Moderate"
+        
+        # FOOLPROOF FIX: Inject warnings directly from subtitle analysis if TMDB failed us
+        if drug_hit_count > 2:
+            final_advisories["Drugs & Alcohol"] = "Severe" if drug_hit_count > 6 else "Moderate"
 
         max_retries = 3
         for attempt in range(max_retries):
