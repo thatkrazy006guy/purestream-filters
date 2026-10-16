@@ -188,50 +188,73 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE ---
+        # --- LAYER 1: GROQ AI ENGINE (GUARANTEED MODEL FETCHER) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
+            
             prompt = (
-                "You are a strict parental media filter. Read these specific numbered subtitle lines. "
-                "Identify ONLY the lines containing actual severe profanity, explicit sexual innuendo, or graphic visual descriptions in brackets. "
-                "Ignore mild words or non-explicit action. "
-                "Return ONLY a raw JSON array of the integers matching the line numbers that violate this policy. "
-                "Do not return any other text. Example: [15, 89, 102]\n\n"
+                "You are a strict parental media filter. Read these specific numbered subtitle lines.\n"
+                "Identify ONLY the lines containing actual severe profanity, explicit sexual innuendo, or graphic visual descriptions in brackets.\n"
+                "Ignore mild words or non-explicit action.\n"
+                "You must respond with a valid JSON object containing a single key 'flags' mapped to an array of the violating line numbers.\n"
+                "Example: {\"flags\": [15, 89, 102]}\n\n"
                 f"{script_chunk}"
             )
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            stable_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
             
-            for model in stable_models:
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            
+            # GUARANTEED FIX: Fetch ONLY the exact models your API key is currently allowed to use.
+            active_models = []
+            try:
+                models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
+                if models_res.status_code == 200:
+                    authorized = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower()]
+                    # Sort to prioritize Llama, then Mixtral, then anything else
+                    authorized.sort(key=lambda x: 0 if 'llama' in x.lower() else 1 if 'mixtral' in x.lower() else 2)
+                    active_models = authorized
+            except Exception as e:
+                print(f"⚠️ Model fetch failed: {e}")
+            
+            for model in active_models:
                 try:
-                    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+                    # GUARANTEED FIX: Force native JSON output to prevent hallucinations
+                    payload = {
+                        "model": model, 
+                        "messages": [{"role": "user", "content": prompt}], 
+                        "temperature": 0.0,
+                        "response_format": {"type": "json_object"}
+                    }
                     response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
                     
                     if response.status_code == 200:
                         ai_text = response.json()["choices"][0]["message"]["content"]
-                        match = re.search(r'\[.*?\]', ai_text, re.DOTALL)
-                        if match:
-                            bad_indices = json.loads(match.group(0))
-                            if len(bad_indices) == 0 and len(suspicious_lines) > 0:
-                                print(f"⚠️ Groq ({model}) hallucinated 0 violations.")
-                                continue
-                            if len(bad_indices) > 100:
-                                print(f"⚠️ Groq ({model}) hallucinated runaway flags.")
-                                break
-                                
-                            print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
-                            for idx in bad_indices:
-                                if 0 <= idx < len(subs):
-                                    start_ms = max(0, subs[idx].start - START_BUFFER_MS + platform_offset)
-                                    end_ms = subs[idx].end + END_BUFFER_MS + platform_offset
-                                    profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
-                            ai_success = True
+                        json_data = json.loads(ai_text)
+                        bad_indices = json_data.get("flags", [])
+                        
+                        # The 40% Sanity Check
+                        if len(bad_indices) == 0:
+                            print(f"⚠️ Groq ({model}) found 0 violations. Rejecting AI response.")
+                            continue
+                        if len(bad_indices) > len(suspicious_lines) * 0.4:
+                            print(f"⚠️ Groq ({model}) flagged {len(bad_indices)} items (suspected hallucination). Rejecting AI response.")
                             break
+                            
+                        print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
+                        for idx in bad_indices:
+                            if 0 <= idx < len(subs):
+                                start_ms = max(0, subs[idx].start - START_BUFFER_MS + platform_offset)
+                                end_ms = subs[idx].end + END_BUFFER_MS + platform_offset
+                                profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+                        ai_success = True
+                        break
                     else:
-                        print(f"⚠️ Groq ({model}) API Error {response.status_code}: {response.text}")
+                        print(f"⚠️ Groq ({model}) rejected: {response.status_code}")
                 except Exception as e:
-                    print(f"⚠️ Groq ({model}) Exception: {e}")
+                    print(f"⚠️ Groq ({model}) error: {e}")
+            
+            if not ai_success:
+                print("⚠️ AI failed sanity checks or network limits. Bypassing AI Engine.")
         
         # --- LAYER 2: REGEX FALLBACK ---
         if not ai_success:
@@ -351,9 +374,7 @@ def shift_sync(title: str, offset_ms: int):
 @app.get("/api/db")
 def view_database():
     try:
-        gh = Github(GITHUB_TOKEN)
-        gist = gh.get_gist(GIST_ID)
+        gh, gist = Github(GITHUB_TOKEN), Github(GITHUB_TOKEN).get_gist(GIST_ID)
         gist_file = list(gist.files.keys())[0]
         return requests.get(gist.files[gist_file].raw_url).json()
-    except Exception as e: 
-        return {"error": str(e)}
+    except Exception as e: return {"error": str(e)}
