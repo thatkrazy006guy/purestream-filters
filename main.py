@@ -15,7 +15,8 @@ app = FastAPI()
 # --- CLOUD CONFIGURATION ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip() # Optional Fallback
 GIST_ID = os.getenv("GIST_ID", "26c5299781dfbc13015947ebff5a6e66").strip()
 
 # --- AUTONOMOUS SYNC TAGS ---
@@ -92,6 +93,25 @@ def fetch_tmdb_rating(media_id, media_type, api_key):
                     return result.get("rating", "")
     except: pass
     return ""
+
+def fetch_tmdb_keywords(media_id, media_type, api_key):
+    if not api_key or not media_id: return {}
+    try:
+        url = f"https://api.themoviedb.org/3/{media_type}/{media_id}/keywords?api_key={api_key}"
+        res = requests.get(url, timeout=5).json()
+        keywords_list = res.get("keywords", []) if media_type == "movie" else res.get("results", [])
+        
+        advisories = {}
+        for kw in keywords_list:
+            name = kw.get("name", "").lower()
+            if "nudity" in name or "sex" in name or "erotic" in name:
+                advisories["Nudity & Sexual Content"] = "Severe"
+            if "drug" in name or "narcotic" in name or "marijuana" in name or "stoner" in name or "alcohol" in name:
+                advisories["Drugs & Alcohol"] = "Severe"
+            if "gore" in name or "blood" in name or "murder" in name or "violence" in name:
+                advisories["Violence & Gore"] = "Severe"
+        return advisories
+    except: return {}
 
 def fetch_community_edl(imdb_id):
     if not imdb_id: return []
@@ -178,17 +198,13 @@ def report_title(req: ReportRequest):
         
         for i, sub in enumerate(subs):
             text = sub.plaintext.replace('\n', ' ').strip()
-            
-            # FOOLPROOF FIX: Native Drug Scanning in Subtitles
             if DRUG_REGEX.search(text):
                 drug_hit_count += 1
-                
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (FOOLPROOF ROUTING) ---
-        if GROQ_API_KEY and suspicious_lines:
-            print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
+        if suspicious_lines:
+            print(f"🧠 Booting Multi-AI Cascading Router on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
             
             prompt = (
@@ -199,68 +215,72 @@ def report_title(req: ReportRequest):
                 "Example: {\"flags\": [15, 89, 102]}\n\n"
                 f"{script_chunk}"
             )
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            
-            # Dynamically grab the exact models your key has access to and filter out the junk
-            active_models = []
-            try:
-                models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
-                if models_res.status_code == 200:
-                    for m in models_res.json().get("data", []):
-                        mid = m["id"].lower()
-                        # Strictly ban prompt-guards, whisper audio, vision models, and tools
-                        if "whisper" not in mid and "guard" not in mid and "vision" not in mid and "tool" not in mid:
-                            active_models.append(m["id"])
-                    
-                    # Prioritize the most stable free models available
-                    active_models.sort(key=lambda x: 0 if 'llama3-8b' in x.lower() else 1 if 'gemma' in x.lower() else 2 if 'mixtral' in x.lower() else 3)
-            except: pass
-            
-            if not active_models:
-                active_models = ["llama3-8b-8192", "gemma2-9b-it", "mixtral-8x7b-32768"]
-                
-            for model in active_models:
+
+            # --- TIER 1: GOOGLE GEMINI (Primary) ---
+            if GEMINI_API_KEY and not ai_success:
                 try:
+                    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
                     payload = {
-                        "model": model, 
-                        "messages": [{"role": "user", "content": prompt}], 
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}
+                    }
+                    response = requests.post(gemini_url, json=payload, timeout=20)
+                    if response.status_code == 200:
+                        ai_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        json_data = json.loads(ai_text)
+                        bad_indices = json_data.get("flags", [])
+                        
+                        if 0 < len(bad_indices) <= len(suspicious_lines) * 0.4:
+                            print(f"✅ AI SUCCESS: Gemini validated {len(bad_indices)} true violations.")
+                            for idx in bad_indices:
+                                if 0 <= idx < len(subs):
+                                    start_ms = max(0, subs[idx].start - START_BUFFER_MS + platform_offset)
+                                    end_ms = subs[idx].end + END_BUFFER_MS + platform_offset
+                                    profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+                            ai_success = True
+                        else:
+                            print("⚠️ Gemini hallucinated or found 0 violations.")
+                    else:
+                        print(f"⚠️ Gemini API Error: {response.status_code}")
+                except Exception as e:
+                    print(f"⚠️ Gemini Network Exception: {e}")
+
+            # --- TIER 2: OPENROUTER (Secondary Fallback) ---
+            if OPENROUTER_API_KEY and not ai_success:
+                try:
+                    print("🔄 Routing to OpenRouter Free Tier Fallback...")
+                    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                    payload = {
+                        "model": "meta-llama/llama-3-8b-instruct:free",
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.0,
                         "response_format": {"type": "json_object"}
                     }
-                    response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
+                    response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=20)
                     
                     if response.status_code == 200:
                         ai_text = response.json()["choices"][0]["message"]["content"]
                         json_data = json.loads(ai_text)
                         bad_indices = json_data.get("flags", [])
                         
-                        if len(bad_indices) == 0:
-                            print(f"⚠️ Groq ({model}) found 0 violations. Trying next model...")
-                            continue # Try next model instead of giving up
-                            
-                        if len(bad_indices) > len(suspicious_lines) * 0.4:
-                            print(f"⚠️ Groq ({model}) hallucinated {len(bad_indices)} items. Trying next model...")
-                            continue # Try next model instead of giving up
-                            
-                        print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
-                        for idx in bad_indices:
-                            if 0 <= idx < len(subs):
-                                start_ms = max(0, subs[idx].start - START_BUFFER_MS + platform_offset)
-                                end_ms = subs[idx].end + END_BUFFER_MS + platform_offset
-                                profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
-                        ai_success = True
-                        break
+                        if 0 < len(bad_indices) <= len(suspicious_lines) * 0.4:
+                            print(f"✅ AI SUCCESS: OpenRouter validated {len(bad_indices)} true violations.")
+                            for idx in bad_indices:
+                                if 0 <= idx < len(subs):
+                                    start_ms = max(0, subs[idx].start - START_BUFFER_MS + platform_offset)
+                                    end_ms = subs[idx].end + END_BUFFER_MS + platform_offset
+                                    profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
+                            ai_success = True
+                        else:
+                            print("⚠️ OpenRouter hallucinated or found 0 violations.")
                     else:
-                        print(f"⚠️ Groq ({model}) rejected: {response.status_code}. Trying next model...")
+                        print(f"⚠️ OpenRouter API Error: {response.status_code}")
                 except Exception as e:
-                    print(f"⚠️ Groq ({model}) error: {e}. Trying next model...")
-            
-            if not ai_success:
-                print("⚠️ All AI models failed or hallucinated. Bypassing AI Engine.")
-        
-        # --- LAYER 2: REGEX FALLBACK ---
+                    print(f"⚠️ OpenRouter Network Exception: {e}")
+
+        # --- TIER 3: REGEX (The Ultimate Safety Net) ---
         if not ai_success:
-            print("⚙️ Running standard Regex Engine...")
+            print("⚙️ AI Providers Failed. Running strict Regex Engine...")
             for idx_str in suspicious_lines:
                 idx = int(idx_str.split("|")[0])
                 sub = subs[idx]
@@ -271,19 +291,19 @@ def report_title(req: ReportRequest):
                 spoken_text = re.sub(r'[\[\(].*?[\]\)]', '', text)
                 if PROFANITY_REGEX.search(spoken_text): profanity_zones.append({"startTimeMs": start_ms, "endTimeMs": end_ms, "skipType": "profanity"})
 
-        # --- LAYER 3: RATING & AUTONOMOUS ADVISORIES ---
+        # --- ADVISORY MERGE ---
         tmdb_certification = fetch_tmdb_rating(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
+        tmdb_keywords = fetch_tmdb_keywords(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
         community_zones = fetch_community_edl(imdb_id)
         
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
         all_zones.sort(key=lambda x: x["startTimeMs"])
 
-        final_advisories = {}
+        final_advisories = {**tmdb_keywords}
         if tmdb_certification: final_advisories["Official Rating"] = tmdb_certification
         if any(z["skipType"] == "profanity" for z in all_zones): final_advisories["Profanity"] = "Severe"
         if any(z["skipType"] == "explicit" for z in all_zones): final_advisories["Nudity & Explicit Content"] = "Moderate"
         
-        # FOOLPROOF FIX: Inject warnings directly from subtitle analysis if TMDB failed us
         if drug_hit_count > 2:
             final_advisories["Drugs & Alcohol"] = "Severe" if drug_hit_count > 6 else "Moderate"
 
