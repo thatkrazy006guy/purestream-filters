@@ -139,7 +139,6 @@ def report_title(req: ReportRequest):
     if req.media_type == "tv" and req.season and req.episode:
         formatted_title = f"{req.title} S{req.season:02d}E{req.episode:02d}"
 
-    # GUARANTEED FIX: Replaced offset logic with dynamic Platform Tags
     platform_offset = 0 
     platform_tag = PLATFORM_TAGS.get(req.package_name, "AMZN")
     
@@ -159,18 +158,18 @@ def report_title(req: ReportRequest):
                 official = results[0].get("title") or results[0].get("name")
                 if official and official not in search_queries: search_queries.append(official)
                 
+                print(f"🎬 TMDB Match Confirmed: '{official}' (ID: {tmdb_media_id})")
+                
                 ext_url = f"https://api.themoviedb.org/3/{tmdb_media_type}/{tmdb_media_id}/external_ids?api_key={TMDB_API_KEY}"
                 imdb_id = requests.get(ext_url, timeout=5).json().get("imdb_id")
-        except: pass
+        except Exception as e: 
+            print(f"⚠️ TMDB Search Error: {e}")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         found_subs = []
         for query in search_queries:
             clean_query = re.sub(r'[\\/:*?"<>|]', '', query).strip()
-            
-            # AUTONOMOUS SYNC: Injects the specific streaming platform tag directly into the search
             dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.{platform_tag}.WEB-DL.mp4")
-            
             open(dummy_mp4, "w").close()
             subprocess.run(["subliminal", "download", "-l", "en", dummy_mp4], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for file in os.listdir(temp_dir):
@@ -195,7 +194,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE ---
+        # --- LAYER 1: GROQ AI ENGINE (STRICT WHITELIST) ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -211,15 +210,25 @@ def report_title(req: ReportRequest):
             
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
+            # STRICT FIX: Block Prompt Guards and Experimental models
+            APPROVED_MODELS = [
+                "llama-3.3-70b-versatile",
+                "llama-3.1-8b-instant",
+                "mixtral-8x7b-32768"
+            ]
+            
             active_models = []
             try:
                 models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
                 if models_res.status_code == 200:
-                    authorized = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower()]
-                    authorized.sort(key=lambda x: 0 if 'llama' in x.lower() else 1 if 'mixtral' in x.lower() else 2)
-                    active_models = authorized
+                    authorized = [m["id"] for m in models_res.json().get("data", [])]
+                    # Intersect approved models with authorized models to prevent 400 errors
+                    active_models = [m for m in APPROVED_MODELS if m in authorized]
             except Exception as e:
                 print(f"⚠️ Model fetch failed: {e}")
+            
+            if not active_models:
+                active_models = ["llama-3.1-8b-instant"] # Ultimate fallback if fetch fails
             
             for model in active_models:
                 try:
@@ -275,6 +284,9 @@ def report_title(req: ReportRequest):
         # --- LAYER 3: OFFICIAL RATING & KEYWORDS MERGE ---
         tmdb_certification = fetch_tmdb_rating(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
         tmdb_keywords = fetch_tmdb_keywords(tmdb_media_id, tmdb_media_type, TMDB_API_KEY)
+        
+        print(f"🏷️ TMDB Advisories Generated: {tmdb_keywords}")
+        
         community_zones = fetch_community_edl(imdb_id)
         
         all_zones = merge_zones(profanity_zones) + merge_zones(explicit_zones) + merge_zones(community_zones)
