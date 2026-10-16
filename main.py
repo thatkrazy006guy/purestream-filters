@@ -18,6 +18,7 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GIST_ID = os.getenv("GIST_ID", "26c5299781dfbc13015947ebff5a6e66").strip()
 
+# --- AUTONOMOUS SYNC TAGS ---
 PLATFORM_TAGS = {
     "com.wbd.stream": "MAX",
     "com.hbo.hbonow": "HBO",
@@ -138,7 +139,10 @@ def report_title(req: ReportRequest):
     if req.media_type == "tv" and req.season and req.episode:
         formatted_title = f"{req.title} S{req.season:02d}E{req.episode:02d}"
 
-    platform_offset = PLATFORM_OFFSETS.get(req.package_name, 0)
+    # GUARANTEED FIX: Replaced offset logic with dynamic Platform Tags
+    platform_offset = 0 
+    platform_tag = PLATFORM_TAGS.get(req.package_name, "AMZN")
+    
     search_queries = [formatted_title]
     base_title = re.sub(r'\s*S\d+E\d+.*', '', formatted_title, flags=re.IGNORECASE).strip()
     if base_title != formatted_title: search_queries.append(base_title)
@@ -159,14 +163,12 @@ def report_title(req: ReportRequest):
                 imdb_id = requests.get(ext_url, timeout=5).json().get("imdb_id")
         except: pass
 
-    platform_tag = PLATFORM_TAGS.get(req.package_name, "AMZN") # Default to AMZN if app is unknown
-
     with tempfile.TemporaryDirectory() as temp_dir:
         found_subs = []
         for query in search_queries:
             clean_query = re.sub(r'[\\/:*?"<>|]', '', query).strip()
             
-            # AUTONOMOUS SYNC: Force scraper to fetch the exact subtitle for the specific streaming app
+            # AUTONOMOUS SYNC: Injects the specific streaming platform tag directly into the search
             dummy_mp4 = os.path.join(temp_dir, f"{clean_query}.1080p.{platform_tag}.WEB-DL.mp4")
             
             open(dummy_mp4, "w").close()
@@ -193,7 +195,7 @@ def report_title(req: ReportRequest):
             if EXPLICIT_REGEX.search(text) or PROFANITY_REGEX.search(re.sub(r'[\[\(].*?[\]\)]', '', text)):
                 suspicious_lines.append(f"{i}|{text}")
 
-        # --- LAYER 1: GROQ AI ENGINE (GUARANTEED MODEL FETCHER) ---
+        # --- LAYER 1: GROQ AI ENGINE ---
         if GROQ_API_KEY and suspicious_lines:
             print(f"🧠 Booting Groq AI Engine on {len(suspicious_lines)} flagged lines...")
             script_chunk = "\n".join(suspicious_lines)
@@ -209,13 +211,11 @@ def report_title(req: ReportRequest):
             
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             
-            # GUARANTEED FIX: Fetch ONLY the exact models your API key is currently allowed to use.
             active_models = []
             try:
                 models_res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
                 if models_res.status_code == 200:
                     authorized = [m["id"] for m in models_res.json().get("data", []) if "whisper" not in m["id"].lower()]
-                    # Sort to prioritize Llama, then Mixtral, then anything else
                     authorized.sort(key=lambda x: 0 if 'llama' in x.lower() else 1 if 'mixtral' in x.lower() else 2)
                     active_models = authorized
             except Exception as e:
@@ -223,7 +223,6 @@ def report_title(req: ReportRequest):
             
             for model in active_models:
                 try:
-                    # GUARANTEED FIX: Force native JSON output to prevent hallucinations
                     payload = {
                         "model": model, 
                         "messages": [{"role": "user", "content": prompt}], 
@@ -237,12 +236,11 @@ def report_title(req: ReportRequest):
                         json_data = json.loads(ai_text)
                         bad_indices = json_data.get("flags", [])
                         
-                        # The 40% Sanity Check
                         if len(bad_indices) == 0:
                             print(f"⚠️ Groq ({model}) found 0 violations. Rejecting AI response.")
                             continue
                         if len(bad_indices) > len(suspicious_lines) * 0.4:
-                            print(f"⚠️ Groq ({model}) flagged {len(bad_indices)} items (suspected hallucination). Rejecting AI response.")
+                            print(f"⚠️ Groq ({model}) flagged {len(bad_indices)} items. Rejecting AI response.")
                             break
                             
                         print(f"✅ AI SUCCESS: Groq ({model}) validated {len(bad_indices)} true violations.")
